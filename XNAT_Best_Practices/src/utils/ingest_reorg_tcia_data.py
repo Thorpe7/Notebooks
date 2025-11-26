@@ -159,13 +159,12 @@ def upload_session_dicom(
             for dcm_file in dicom_files:
                 zf.write(str(dcm_file), arcname=dcm_file.name)
 
-        # Use XNAT's import service
+        # Use XNAT's import service - import directly to archive (no prearchive)
         session.services.import_(
             zip_path,
             project=project.id,
             subject=subject_label,
             experiment=experiment_label,
-            destination="/prearchive",
             overwrite="delete"
         )
 
