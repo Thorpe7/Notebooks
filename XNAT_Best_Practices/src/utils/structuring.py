@@ -15,15 +15,18 @@ XNAT expects the following hierarchy for pre-structured archives:
 Usage:
     from src.utils.structuring import structure_dicom_for_xnat
 
+    # For a directory with DICOMs (like example_subject):
     archive_path = structure_dicom_for_xnat(
-        dicom_path="data/Test_Subject_999.dcm",
-        subject_label="Test_Subject_999",
-        session_label="Test_Subject_999_MR1",
+        dicom_path="example_subject",
+        subject_label="Example_Subject_001",
+        session_label="Example_Subject_001_MR1",
         output_dir="data",
+        create_zip=True,
     )
 """
 
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Union
 
@@ -237,6 +240,153 @@ def structure_multiple_series(
         print(f"  Scan {scan_number}: {scan_folder_name} ({len(dicom_files)} files)")
 
     print(f"Structured {len(dicom_paths)} scan(s) into: {archive_base}")
+
+    if create_zip:
+        zip_path = output_dir / f"{archive_name}.zip"
+        shutil.make_archive(str(zip_path.with_suffix("")), "zip", output_dir, archive_name)
+        print(f"Created ZIP archive: {zip_path}")
+        return zip_path
+
+    return archive_base
+
+
+def structure_dicom_directory_for_xnat(
+    dicom_dir: Union[str, Path],
+    subject_label: str,
+    session_label: Optional[str] = None,
+    output_dir: Union[str, Path] = "data",
+    create_zip: bool = False,
+) -> Path:
+    """
+    Auto-discover and organize all DICOM series from a directory into XNAT archive format.
+
+    This function scans a directory (recursively) for DICOM files, groups them by
+    SeriesInstanceUID, and creates the proper XNAT archive structure with each
+    series as a separate scan.
+
+    Parameters
+    ----------
+    dicom_dir : str or Path
+        Path to a directory containing DICOM files (can be nested).
+    subject_label : str
+        The subject/patient label to use in the archive structure.
+    session_label : str, optional
+        The session/experiment label. If not provided, defaults to "{subject_label}_MR1".
+    output_dir : str or Path
+        Base directory where the structured archive will be created.
+        Default is "data".
+    create_zip : bool
+        If True, also create a ZIP archive of the structured directory.
+        Default is False.
+
+    Returns
+    -------
+    Path
+        Path to the created archive directory (or ZIP file if create_zip=True).
+
+    Example
+    -------
+    >>> from src.utils.structuring import structure_dicom_directory_for_xnat
+    >>> archive_path = structure_dicom_directory_for_xnat(
+    ...     dicom_dir="example_subject",
+    ...     subject_label="Example_Subject_001",
+    ...     session_label="Example_Subject_001_MR1",
+    ...     output_dir="data",
+    ...     create_zip=True,
+    ... )
+    """
+    dicom_dir = Path(dicom_dir)
+    output_dir = Path(output_dir)
+
+    if not dicom_dir.exists():
+        raise FileNotFoundError(f"DICOM directory not found: {dicom_dir}")
+
+    if not dicom_dir.is_dir():
+        raise ValueError(f"Path is not a directory: {dicom_dir}")
+
+    # Find all DICOM files recursively
+    dicom_files = list(dicom_dir.glob("**/*.dcm"))
+    if not dicom_files:
+        raise ValueError(f"No DICOM files found in: {dicom_dir}")
+
+    print(f"Found {len(dicom_files)} DICOM files in {dicom_dir}")
+
+    # Group files by SeriesInstanceUID
+    series_groups: dict[str, list[Path]] = defaultdict(list)
+    series_metadata: dict[str, dict] = {}
+
+    for dcm_file in dicom_files:
+        try:
+            ds = pydicom.dcmread(str(dcm_file), stop_before_pixels=True)
+            series_uid = getattr(ds, "SeriesInstanceUID", "Unknown")
+
+            series_groups[series_uid].append(dcm_file)
+
+            # Store metadata from first file of each series
+            if series_uid not in series_metadata:
+                series_metadata[series_uid] = {
+                    "SeriesDescription": getattr(ds, "SeriesDescription", "Unknown_Series"),
+                    "SeriesNumber": getattr(ds, "SeriesNumber", None),
+                    "Modality": getattr(ds, "Modality", "Unknown"),
+                }
+        except Exception as e:
+            print(f"  Warning: Could not read {dcm_file}: {e}")
+            continue
+
+    if not series_groups:
+        raise ValueError("No valid DICOM files could be read")
+
+    print(f"Found {len(series_groups)} series")
+
+    # Set default session label
+    if session_label is None:
+        session_label = f"{subject_label}_MR1"
+
+    # Sanitize labels
+    subject_label_safe = sanitize_label(subject_label)
+    session_label_safe = sanitize_label(session_label)
+    archive_name = f"{subject_label_safe}_archive"
+    archive_base = output_dir / archive_name
+
+    # Sort series by SeriesNumber if available, otherwise by UID
+    def sort_key(item):
+        uid, _ = item
+        series_num = series_metadata.get(uid, {}).get("SeriesNumber")
+        if series_num is not None:
+            return (0, series_num, uid)
+        return (1, 0, uid)
+
+    sorted_series = sorted(series_groups.items(), key=sort_key)
+
+    # Create archive structure for each series
+    for scan_number, (series_uid, files) in enumerate(sorted_series, start=1):
+        metadata = series_metadata.get(series_uid, {})
+        series_description = sanitize_label(metadata.get("SeriesDescription", "Unknown_Series"))
+        modality = metadata.get("Modality", "Unknown")
+
+        scan_folder_name = f"{scan_number}-{series_description}"
+        dicom_dest = (
+            archive_base
+            / subject_label_safe
+            / session_label_safe
+            / "scans"
+            / scan_folder_name
+            / "resources"
+            / "DICOM"
+        )
+
+        dicom_dest.mkdir(parents=True, exist_ok=True)
+
+        # Copy files with sequential naming
+        for idx, src_file in enumerate(sorted(files), start=1):
+            dest_filename = f"{idx:04d}.dcm"
+            shutil.copy2(src_file, dicom_dest / dest_filename)
+
+        print(f"  Scan {scan_number}: {scan_folder_name} ({len(files)} files, {modality})")
+
+    print(f"\nStructured {len(sorted_series)} scan(s) into: {archive_base}")
+    print(f"  Subject: {subject_label_safe}")
+    print(f"  Session: {session_label_safe}")
 
     if create_zip:
         zip_path = output_dir / f"{archive_name}.zip"
