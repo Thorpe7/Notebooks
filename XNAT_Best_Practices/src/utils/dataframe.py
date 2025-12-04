@@ -42,7 +42,7 @@ def extract_session_metadata(experiment) -> dict:
     """Extract session-level metadata from an experiment object."""
     return {
         'session_label': experiment.label,
-        'session_type': experiment.xsi_type,
+        'session_type': getattr(experiment, 'xsi_type', None),
         'date': getattr(experiment, 'date', None),
         'age': getattr(experiment, 'age', None),
     }
@@ -100,6 +100,7 @@ def build_project_dataframe(
 
     with xnat.connect(**conn_params) as session:
         records = collect_project_metadata(session, project_id)
+        print(records)
 
     df = pd.DataFrame(records)
 
