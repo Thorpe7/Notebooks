@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pydicom
+from pydicom.uid import generate_uid
 
 
 def sanitize_label(label: str) -> str:
@@ -40,6 +41,52 @@ def sanitize_label(label: str) -> str:
     # Remove any other problematic characters
     sanitized = "".join(c for c in sanitized if c.isalnum() or c in "_-.")
     return sanitized
+
+
+def regenerate_uids(
+    ds: pydicom.Dataset,
+    new_study_uid: str,
+    new_series_uid: str,
+) -> pydicom.Dataset:
+    """
+    Regenerate Study and Series Instance UIDs for a DICOM dataset.
+
+    This function updates the UIDs in a DICOM dataset to new values, which is useful
+    when uploading example data multiple times to avoid conflicts with existing data.
+
+    Parameters
+    ----------
+    ds : pydicom.Dataset
+        The DICOM dataset to modify.
+    new_study_uid : str
+        The new Study Instance UID to assign.
+    new_series_uid : str
+        The new Series Instance UID to assign.
+
+    Returns
+    -------
+    pydicom.Dataset
+        The modified dataset with new UIDs.
+    """
+    # Generate a new SOP Instance UID for each file (must be unique per instance)
+    ds.SOPInstanceUID = generate_uid()
+
+    # Update the MediaStorageSOPInstanceUID in file meta to match
+    if hasattr(ds, "file_meta") and hasattr(ds.file_meta, "MediaStorageSOPInstanceUID"):
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+
+    # Update Study Instance UID
+    ds.StudyInstanceUID = new_study_uid
+
+    # Update Series Instance UID
+    ds.SeriesInstanceUID = new_series_uid
+
+    # Update Frame of Reference UID if present (should be consistent within a series)
+    if hasattr(ds, "FrameOfReferenceUID"):
+        # Generate a deterministic UID based on series UID for consistency within series
+        ds.FrameOfReferenceUID = generate_uid()
+
+    return ds
 
 
 def structure_dicom_for_xnat(
@@ -256,6 +303,7 @@ def structure_dicom_directory_for_xnat(
     session_label: Optional[str] = None,
     output_dir: Union[str, Path] = "data",
     create_zip: bool = False,
+    new_uids: bool = True,
 ) -> Path:
     """
     Auto-discover and organize all DICOM series from a directory into XNAT archive format.
@@ -278,6 +326,9 @@ def structure_dicom_directory_for_xnat(
     create_zip : bool
         If True, also create a ZIP archive of the structured directory.
         Default is False.
+    new_uids : bool
+        If True (default), generate new Study and Series Instance UIDs for all files.
+        This prevents conflicts when uploading the same example data multiple times.
 
     Returns
     -------
@@ -358,6 +409,12 @@ def structure_dicom_directory_for_xnat(
 
     sorted_series = sorted(series_groups.items(), key=sort_key)
 
+    # Generate new Study UID if requested (same for all series in this session)
+    new_study_uid = generate_uid() if new_uids else None
+
+    if new_uids:
+        print("Generating new UIDs for all DICOM files...")
+
     # Create archive structure for each series
     for scan_number, (series_uid, files) in enumerate(sorted_series, start=1):
         metadata = series_metadata.get(series_uid, {})
@@ -377,10 +434,22 @@ def structure_dicom_directory_for_xnat(
 
         dicom_dest.mkdir(parents=True, exist_ok=True)
 
-        # Copy files with sequential naming
+        # Generate new Series UID for this series if requested
+        new_series_uid = generate_uid() if new_uids else None
+
+        # Copy/write files with sequential naming
         for idx, src_file in enumerate(sorted(files), start=1):
             dest_filename = f"{idx:04d}.dcm"
-            shutil.copy2(src_file, dicom_dest / dest_filename)
+            dest_path = dicom_dest / dest_filename
+
+            if new_uids:
+                # Read, modify UIDs, and write the DICOM file
+                ds = pydicom.dcmread(str(src_file))
+                ds = regenerate_uids(ds, new_study_uid, new_series_uid)
+                ds.save_as(str(dest_path))
+            else:
+                # Just copy the file as-is
+                shutil.copy2(src_file, dest_path)
 
         print(f"  Scan {scan_number}: {scan_folder_name} ({len(files)} files, {modality})")
 
