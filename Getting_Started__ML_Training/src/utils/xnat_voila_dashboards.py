@@ -912,3 +912,336 @@ def gradcam_dashboard(
     controls = HBox([filter_dropdown, counter_label, nav_buttons])
 
     return VBox([controls, out])
+
+
+# -------------------------------------------------------------------------
+# 7. Training Run Comparison Dashboard
+# -------------------------------------------------------------------------
+
+def run_comparison_dashboard(
+    runs_dir: str = "training_runs",
+) -> VBox:
+    """
+    Dashboard to load, compare, and visualize different training runs.
+
+    Parameters
+    ----------
+    runs_dir : str
+        Directory containing saved training runs
+
+    Returns
+    -------
+    ipywidgets.VBox
+    """
+    from .training_runs import list_training_runs, load_training_run, compare_runs_summary
+    from sklearn.metrics import f1_score, precision_score, recall_score
+
+    # State to hold loaded runs
+    state = {
+        "loaded_runs": {},  # run_id -> TrainingRunData
+        "current_run_id": None,
+    }
+
+    # Refresh available runs
+    def _get_available_runs():
+        return list_training_runs(runs_dir)
+
+    available_runs = _get_available_runs()
+
+    if not available_runs:
+        return VBox([
+            widgets.HTML(
+                f"<p style='color: orange;'>No training runs found in '{runs_dir}'. "
+                "Save a training run first using <code>save_training_run()</code>.</p>"
+            )
+        ])
+
+    # Create run selector dropdown
+    run_options = [(f"{r.run_name} ({r.run_id})", r.run_id) for r in available_runs]
+
+    run_selector = widgets.Dropdown(
+        options=run_options,
+        value=run_options[0][1] if run_options else None,
+        description="Select Run:",
+        style={"description_width": "80px"},
+        layout=widgets.Layout(width="400px"),
+    )
+
+    refresh_btn = widgets.Button(
+        description="Refresh",
+        button_style="info",
+        icon="refresh",
+    )
+
+    # Visualization type selector
+    viz_selector = widgets.ToggleButtons(
+        options=[
+            ("Summary", "summary"),
+            ("Loss Curves", "loss"),
+            ("ROC Curves", "roc"),
+            ("Confusion Matrix", "cm"),
+            ("Compare All", "compare"),
+        ],
+        value="summary",
+        description="View:",
+    )
+
+    out = widgets.Output()
+
+    def _load_run(run_id: str):
+        """Load a run if not already loaded."""
+        if run_id not in state["loaded_runs"]:
+            from pathlib import Path
+            run_path = Path(runs_dir) / run_id
+            state["loaded_runs"][run_id] = load_training_run(str(run_path))
+        return state["loaded_runs"][run_id]
+
+    def _show_summary(run):
+        """Display run summary."""
+        meta = run.metadata
+        accuracy = (run.labels == run.preds).mean()
+        f1 = f1_score(run.labels, run.preds, average="macro", zero_division=0)
+        precision = precision_score(run.labels, run.preds, average="macro", zero_division=0)
+        recall = recall_score(run.labels, run.preds, average="macro", zero_division=0)
+
+        html = f"""
+        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 10px 0;">
+            <h3 style="margin-top: 0;">{meta.run_name}</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td><b>Run ID:</b></td><td>{meta.run_id}</td></tr>
+                <tr><td><b>Model:</b></td><td>{meta.model_name}</td></tr>
+                <tr><td><b>Created:</b></td><td>{meta.created_at}</td></tr>
+                <tr><td><b>Epochs:</b></td><td>{meta.num_epochs}</td></tr>
+                <tr><td><b>Classes:</b></td><td>{', '.join(meta.class_names)}</td></tr>
+            </table>
+            <hr>
+            <h4>Performance Metrics</h4>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td><b>Accuracy:</b></td><td>{accuracy:.4f}</td></tr>
+                <tr><td><b>F1 (macro):</b></td><td>{f1:.4f}</td></tr>
+                <tr><td><b>Precision (macro):</b></td><td>{precision:.4f}</td></tr>
+                <tr><td><b>Recall (macro):</b></td><td>{recall:.4f}</td></tr>
+            </table>
+        """
+
+        if meta.hyperparameters:
+            html += "<hr><h4>Hyperparameters</h4><table>"
+            for k, v in meta.hyperparameters.items():
+                html += f"<tr><td><b>{k}:</b></td><td>{v}</td></tr>"
+            html += "</table>"
+
+        if meta.notes:
+            html += f"<hr><p><b>Notes:</b> {meta.notes}</p>"
+
+        html += "</div>"
+
+        display(widgets.HTML(html))
+
+    def _show_loss_curves(run):
+        """Display loss curves."""
+        history = run.history
+        epochs = range(1, len(history.get("train_loss", [])) + 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        # Loss
+        if history.get("train_loss"):
+            axes[0].plot(epochs, history["train_loss"], "-o", label="Train", markersize=3)
+        if history.get("val_loss"):
+            axes[0].plot(epochs, history["val_loss"], "-o", label="Val", markersize=3)
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].set_title("Loss Curves")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # Error rate
+        if history.get("train_err"):
+            axes[1].plot(epochs, history["train_err"], "-o", label="Train", markersize=3)
+        if history.get("val_err"):
+            axes[1].plot(epochs, history["val_err"], "-o", label="Val", markersize=3)
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Error Rate")
+        axes[1].set_title("Error Rate Curves")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def _show_roc_curves(run):
+        """Display ROC curves."""
+        n_classes = run.probs.shape[1]
+        y_true_bin = label_binarize(run.labels, classes=list(range(n_classes)))
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
+        for i in range(n_classes):
+            fpr, tpr, _ = roc_curve(y_true_bin[:, i], run.probs[:, i])
+            roc_auc = auc(fpr, tpr)
+            ax.plot(fpr, tpr, color=colors[i],
+                   label=f"{run.metadata.class_names[i]} (AUC={roc_auc:.3f})")
+
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.5)
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(f"ROC Curves - {run.metadata.run_name}")
+        ax.legend(loc="lower right", fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def _show_confusion_matrix(run):
+        """Display confusion matrix."""
+        cm = confusion_matrix(run.labels, run.preds)
+        class_names = run.metadata.class_names
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+        ax.figure.colorbar(im, ax=ax)
+
+        ax.set_xticks(np.arange(len(class_names)))
+        ax.set_yticks(np.arange(len(class_names)))
+        ax.set_xticklabels(class_names, rotation=45, ha="right")
+        ax.set_yticklabels(class_names)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title(f"Confusion Matrix - {run.metadata.run_name}")
+
+        # Annotate
+        thresh = cm.max() / 2
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, cm[i, j], ha="center", va="center",
+                       color="white" if cm[i, j] > thresh else "black")
+
+        plt.tight_layout()
+        plt.show()
+
+    def _show_comparison():
+        """Compare all runs."""
+        all_run_ids = [opt[1] for opt in run_options]
+        runs = [_load_run(rid) for rid in all_run_ids]
+        summaries = compare_runs_summary(runs)
+
+        # Create comparison table
+        html = """
+        <h3>Run Comparison</h3>
+        <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+            <thead style="background: #e9ecef;">
+                <tr>
+                    <th style="padding: 8px; text-align: left;">Run Name</th>
+                    <th style="padding: 8px;">Model</th>
+                    <th style="padding: 8px;">Epochs</th>
+                    <th style="padding: 8px;">Accuracy</th>
+                    <th style="padding: 8px;">F1 (macro)</th>
+                    <th style="padding: 8px;">Best Val Loss</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        # Find best values for highlighting
+        best_acc = max(s["accuracy"] for s in summaries)
+        best_f1 = max(s["f1_macro"] for s in summaries)
+        best_loss = min(s["best_val_loss"] for s in summaries if s["best_val_loss"])
+
+        for s in summaries:
+            acc_style = "color: green; font-weight: bold;" if s["accuracy"] == best_acc else ""
+            f1_style = "color: green; font-weight: bold;" if s["f1_macro"] == best_f1 else ""
+            loss_style = "color: green; font-weight: bold;" if s["best_val_loss"] == best_loss else ""
+
+            html += f"""
+                <tr>
+                    <td style="padding: 8px;">{s['run_name']}</td>
+                    <td style="padding: 8px; text-align: center;">{s['model_name']}</td>
+                    <td style="padding: 8px; text-align: center;">{s['num_epochs']}</td>
+                    <td style="padding: 8px; text-align: center; {acc_style}">{s['accuracy']:.4f}</td>
+                    <td style="padding: 8px; text-align: center; {f1_style}">{s['f1_macro']:.4f}</td>
+                    <td style="padding: 8px; text-align: center; {loss_style}">{s['best_val_loss']:.4f}</td>
+                </tr>
+            """
+
+        html += "</tbody></table>"
+        display(widgets.HTML(html))
+
+        # Plot comparison charts
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        run_names = [s["run_name"][:20] for s in summaries]
+        accuracies = [s["accuracy"] for s in summaries]
+        f1_scores_list = [s["f1_macro"] for s in summaries]
+
+        x = np.arange(len(run_names))
+        width = 0.35
+
+        axes[0].bar(x - width/2, accuracies, width, label="Accuracy", color="#2ecc71")
+        axes[0].bar(x + width/2, f1_scores_list, width, label="F1 (macro)", color="#3498db")
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(run_names, rotation=45, ha="right")
+        axes[0].set_ylabel("Score")
+        axes[0].set_title("Accuracy & F1 Comparison")
+        axes[0].legend()
+        axes[0].set_ylim(0, 1.1)
+        axes[0].grid(True, alpha=0.3, axis="y")
+
+        # Loss comparison
+        for run in runs:
+            if run.history.get("val_loss"):
+                axes[1].plot(run.history["val_loss"], label=run.metadata.run_name[:15])
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Validation Loss")
+        axes[1].set_title("Validation Loss Comparison")
+        axes[1].legend(fontsize=8)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def _update(change=None):
+        with out:
+            out.clear_output(wait=True)
+
+            viz_type = viz_selector.value
+
+            if viz_type == "compare":
+                _show_comparison()
+            else:
+                run_id = run_selector.value
+                if run_id:
+                    run = _load_run(run_id)
+                    state["current_run_id"] = run_id
+
+                    if viz_type == "summary":
+                        _show_summary(run)
+                    elif viz_type == "loss":
+                        _show_loss_curves(run)
+                    elif viz_type == "roc":
+                        _show_roc_curves(run)
+                    elif viz_type == "cm":
+                        _show_confusion_matrix(run)
+
+    def _refresh(btn):
+        nonlocal available_runs, run_options
+        available_runs = _get_available_runs()
+        run_options = [(f"{r.run_name} ({r.run_id})", r.run_id) for r in available_runs]
+        run_selector.options = run_options
+        if run_options:
+            run_selector.value = run_options[0][1]
+        _update()
+
+    # Wire up
+    run_selector.observe(_update, names="value")
+    viz_selector.observe(_update, names="value")
+    refresh_btn.on_click(_refresh)
+
+    # Initial display
+    _update()
+
+    # Layout
+    top_row = HBox([run_selector, refresh_btn])
+    controls = VBox([top_row, viz_selector])
+
+    return VBox([controls, out])
