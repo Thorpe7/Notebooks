@@ -17,13 +17,14 @@ Jupyter and Voila, e.g.:
 All plots are rendered with matplotlib and updated via ipywidgets.
 """
 
-from typing import Sequence, Mapping, Optional
+from typing import Sequence, Mapping, Optional, List
 
 import numpy as np
 import ipywidgets as widgets
 from ipywidgets import VBox, HBox
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
 
 
 # -------------------------------------------------------------------------
@@ -473,3 +474,441 @@ def pixel_intensity_dashboard(
     _update()
 
     return VBox([controls_top, out])
+
+
+# -------------------------------------------------------------------------
+# 5. ROC Curves dashboard with toggleable class lines
+# -------------------------------------------------------------------------
+
+def roc_curves_dashboard(
+    y_true: Sequence[int],
+    y_probs: np.ndarray,
+    class_names: Optional[Sequence[str]] = None,
+) -> VBox:
+    """
+    Interactive ROC curves dashboard with checkboxes to toggle class visibility.
+
+    Parameters
+    ----------
+    y_true : sequence of int
+        Ground truth labels (n_samples,)
+    y_probs : np.ndarray
+        Prediction probabilities (n_samples, n_classes)
+    class_names : sequence of str, optional
+        Human-readable class names
+
+    Returns
+    -------
+    ipywidgets.VBox
+    """
+    y_true = _ensure_numpy(y_true)
+    y_probs = _ensure_numpy(y_probs)
+
+    n_classes = y_probs.shape[1]
+
+    if class_names is None:
+        class_names = [f"Class {i}" for i in range(n_classes)]
+    else:
+        class_names = list(class_names)
+
+    # Binarize labels for multi-class ROC
+    y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
+
+    # Compute ROC curve and AUC for each class
+    fpr = {}
+    tpr = {}
+    roc_auc = {}
+
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_probs[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    # Compute macro-average ROC curve
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+    mean_tpr /= n_classes
+
+    fpr["macro"] = all_fpr
+    tpr["macro"] = mean_tpr
+    roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+
+    # Create checkboxes for each class
+    colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
+
+    checkboxes = []
+    for i in range(n_classes):
+        cb = widgets.Checkbox(
+            value=True,
+            description=f"{class_names[i]} (AUC={roc_auc[i]:.3f})",
+            indent=False,
+            layout=widgets.Layout(width="auto"),
+        )
+        checkboxes.append(cb)
+
+    # Macro average checkbox
+    macro_checkbox = widgets.Checkbox(
+        value=True,
+        description=f"Macro-avg (AUC={roc_auc['macro']:.3f})",
+        indent=False,
+        layout=widgets.Layout(width="auto"),
+    )
+
+    # Random baseline checkbox
+    baseline_checkbox = widgets.Checkbox(
+        value=True,
+        description="Random baseline",
+        indent=False,
+        layout=widgets.Layout(width="auto"),
+    )
+
+    # Select all / deselect all buttons
+    select_all_btn = widgets.Button(description="Select All", button_style="info")
+    deselect_all_btn = widgets.Button(description="Deselect All", button_style="warning")
+
+    out = widgets.Output()
+
+    def _update(change=None):
+        with out:
+            out.clear_output(wait=True)
+            fig, ax = plt.subplots(figsize=(10, 8))
+
+            # Plot macro-average ROC
+            if macro_checkbox.value:
+                ax.plot(
+                    fpr["macro"],
+                    tpr["macro"],
+                    label=f"Macro-average (AUC = {roc_auc['macro']:.3f})",
+                    color="navy",
+                    linestyle="--",
+                    linewidth=2,
+                )
+
+            # Plot per-class ROC curves based on checkbox state
+            for i, (cb, color) in enumerate(zip(checkboxes, colors)):
+                if cb.value:
+                    ax.plot(
+                        fpr[i],
+                        tpr[i],
+                        color=color,
+                        label=f"{class_names[i]} (AUC = {roc_auc[i]:.3f})",
+                        linewidth=1.5,
+                    )
+
+            # Plot diagonal (random classifier)
+            if baseline_checkbox.value:
+                ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Random")
+
+            ax.set_xlim([0.0, 1.0])
+            ax.set_ylim([0.0, 1.05])
+            ax.set_xlabel("False Positive Rate")
+            ax.set_ylabel("True Positive Rate")
+            ax.set_title("ROC Curves (One-vs-Rest)")
+            ax.legend(loc="lower right", fontsize=9)
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.show()
+
+    def _select_all(btn):
+        for cb in checkboxes:
+            cb.value = True
+        macro_checkbox.value = True
+        baseline_checkbox.value = True
+
+    def _deselect_all(btn):
+        for cb in checkboxes:
+            cb.value = False
+        macro_checkbox.value = False
+        baseline_checkbox.value = False
+
+    # Wire up observers
+    for cb in checkboxes:
+        cb.observe(_update, names="value")
+    macro_checkbox.observe(_update, names="value")
+    baseline_checkbox.observe(_update, names="value")
+
+    select_all_btn.on_click(_select_all)
+    deselect_all_btn.on_click(_deselect_all)
+
+    # Initial render
+    _update()
+
+    # Layout
+    buttons_row = HBox([select_all_btn, deselect_all_btn])
+    special_checkboxes = HBox([macro_checkbox, baseline_checkbox])
+    class_checkboxes = HBox(checkboxes, layout=widgets.Layout(flex_flow="row wrap"))
+
+    controls = VBox([buttons_row, special_checkboxes, class_checkboxes])
+
+    return VBox([controls, out])
+
+
+# -------------------------------------------------------------------------
+# 6. Grad-CAM interactive dashboard
+# -------------------------------------------------------------------------
+
+def gradcam_dashboard(
+    model,
+    images: np.ndarray,
+    labels: np.ndarray,
+    preds: np.ndarray,
+    probs: np.ndarray,
+    class_names: Sequence[str],
+    target_layer,
+    device: str = "cuda",
+) -> VBox:
+    """
+    Interactive Grad-CAM dashboard with navigation buttons.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained model
+    images : np.ndarray
+        Validation images (n_samples, C, H, W)
+    labels : np.ndarray
+        Ground truth labels
+    preds : np.ndarray
+        Predicted labels
+    probs : np.ndarray
+        Prediction probabilities
+    class_names : sequence of str
+        Class names
+    target_layer : torch.nn.Module
+        Target layer for Grad-CAM
+    device : str
+        Device to run model on
+
+    Returns
+    -------
+    ipywidgets.VBox
+    """
+    import torch
+    import torch.nn.functional as F
+
+    try:
+        import cv2
+        HAS_CV2 = True
+    except ImportError:
+        HAS_CV2 = False
+
+    labels = _ensure_numpy(labels)
+    preds = _ensure_numpy(preds)
+    probs = _ensure_numpy(probs)
+
+    n_samples = len(labels)
+    class_names = list(class_names)
+
+    # Separate correct and incorrect predictions
+    correct_mask = labels == preds
+    incorrect_indices = np.where(~correct_mask)[0]
+    correct_indices = np.where(correct_mask)[0]
+
+    # Create a shuffled list prioritizing incorrect predictions
+    all_indices = list(incorrect_indices) + list(correct_indices)
+    np.random.shuffle(all_indices[:len(incorrect_indices)])  # Shuffle incorrect
+    np.random.shuffle(all_indices[len(incorrect_indices):])  # Shuffle correct
+
+    if len(all_indices) == 0:
+        return VBox([widgets.HTML("<p>No samples available for visualization.</p>")])
+
+    # State
+    state = {"current_idx": 0, "sample_list": all_indices}
+
+    # Grad-CAM helper class
+    class GradCAM:
+        def __init__(self, model, target_layer):
+            self.model = model
+            self.target_layer = target_layer
+            self.gradients = None
+            self.activations = None
+            self._register_hooks()
+
+        def _register_hooks(self):
+            def forward_hook(module, input, output):
+                self.activations = output.detach()
+
+            def backward_hook(module, grad_input, grad_output):
+                self.gradients = grad_output[0].detach()
+
+            self.target_layer.register_forward_hook(forward_hook)
+            self.target_layer.register_full_backward_hook(backward_hook)
+
+        def generate_cam(self, input_tensor, target_class=None):
+            self.model.eval()
+            output = self.model(input_tensor)
+
+            if target_class is None:
+                target_class = output.argmax(dim=1).item()
+
+            self.model.zero_grad()
+            one_hot = torch.zeros_like(output)
+            one_hot[0, target_class] = 1
+            output.backward(gradient=one_hot, retain_graph=True)
+
+            weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+            cam = (weights * self.activations).sum(dim=1, keepdim=True)
+            cam = F.relu(cam)
+            cam = cam.squeeze().cpu().numpy()
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+            return cam
+
+    gradcam = GradCAM(model, target_layer)
+
+    # Widgets
+    prev_btn = widgets.Button(
+        description="Previous",
+        button_style="info",
+        icon="arrow-left",
+    )
+    next_btn = widgets.Button(
+        description="Next",
+        button_style="info",
+        icon="arrow-right",
+    )
+    random_btn = widgets.Button(
+        description="Random",
+        button_style="warning",
+        icon="random",
+    )
+
+    # Filter dropdown
+    filter_dropdown = widgets.Dropdown(
+        options=[("All samples", "all"), ("Correct only", "correct"), ("Incorrect only", "incorrect")],
+        value="all",
+        description="Filter:",
+    )
+
+    # Sample counter
+    counter_label = widgets.HTML(value="")
+
+    out = widgets.Output()
+
+    def _get_filtered_indices():
+        filter_val = filter_dropdown.value
+        if filter_val == "correct":
+            return list(correct_indices)
+        elif filter_val == "incorrect":
+            return list(incorrect_indices)
+        else:
+            return all_indices
+
+    def _update_display():
+        filtered = _get_filtered_indices()
+        if len(filtered) == 0:
+            with out:
+                out.clear_output(wait=True)
+                print("No samples match the current filter.")
+            counter_label.value = "<b>0 / 0</b>"
+            return
+
+        # Clamp current index
+        state["current_idx"] = state["current_idx"] % len(filtered)
+        sample_idx = filtered[state["current_idx"]]
+
+        img = images[sample_idx]
+        true_label = labels[sample_idx]
+        pred_label = preds[sample_idx]
+        confidence = probs[sample_idx][pred_label]
+
+        # Generate Grad-CAM
+        input_tensor = torch.from_numpy(img).unsqueeze(0).float().to(device)
+        cam = gradcam.generate_cam(input_tensor, target_class=pred_label)
+
+        # Prepare image for display
+        img_display = img.transpose(1, 2, 0)
+        img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8)
+
+        # Resize CAM to image size
+        if HAS_CV2:
+            cam_resized = cv2.resize(cam, (img.shape[2], img.shape[1]))
+            heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+        else:
+            # Fallback without cv2
+            from scipy.ndimage import zoom
+            scale_h = img.shape[1] / cam.shape[0]
+            scale_w = img.shape[2] / cam.shape[1]
+            cam_resized = zoom(cam, (scale_h, scale_w), order=1)
+            # Simple colormap
+            heatmap = plt.cm.jet(cam_resized)[:, :, :3]
+
+        # Blend
+        overlay = 0.6 * img_display + 0.4 * heatmap
+        overlay = np.clip(overlay, 0, 1)
+
+        # Update counter
+        counter_label.value = f"<b>Sample {state['current_idx'] + 1} / {len(filtered)}</b>"
+
+        is_correct = true_label == pred_label
+        status_color = "green" if is_correct else "red"
+        status_text = "CORRECT" if is_correct else "INCORRECT"
+
+        with out:
+            out.clear_output(wait=True)
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # Original image
+            axes[0].imshow(img_display)
+            axes[0].set_title(
+                f"True: {class_names[true_label]}\n"
+                f"Pred: {class_names[pred_label]} ({confidence:.1%})",
+                fontsize=11,
+            )
+            axes[0].axis("off")
+
+            # Grad-CAM overlay
+            axes[1].imshow(overlay)
+            axes[1].set_title("Grad-CAM Attention Map", fontsize=11)
+            axes[1].axis("off")
+
+            # Add status text
+            fig.suptitle(
+                f"Prediction: {status_text}",
+                fontsize=14,
+                color=status_color,
+                fontweight="bold",
+            )
+
+            plt.tight_layout()
+            plt.show()
+
+    def _on_prev(btn):
+        filtered = _get_filtered_indices()
+        if len(filtered) > 0:
+            state["current_idx"] = (state["current_idx"] - 1) % len(filtered)
+            _update_display()
+
+    def _on_next(btn):
+        filtered = _get_filtered_indices()
+        if len(filtered) > 0:
+            state["current_idx"] = (state["current_idx"] + 1) % len(filtered)
+            _update_display()
+
+    def _on_random(btn):
+        filtered = _get_filtered_indices()
+        if len(filtered) > 0:
+            state["current_idx"] = np.random.randint(0, len(filtered))
+            _update_display()
+
+    def _on_filter_change(change):
+        state["current_idx"] = 0
+        _update_display()
+
+    # Wire up
+    prev_btn.on_click(_on_prev)
+    next_btn.on_click(_on_next)
+    random_btn.on_click(_on_random)
+    filter_dropdown.observe(_on_filter_change, names="value")
+
+    # Initial display
+    _update_display()
+
+    # Layout
+    nav_buttons = HBox([prev_btn, next_btn, random_btn])
+    controls = HBox([filter_dropdown, counter_label, nav_buttons])
+
+    return VBox([controls, out])
