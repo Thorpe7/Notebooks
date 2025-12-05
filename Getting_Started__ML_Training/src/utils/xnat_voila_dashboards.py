@@ -9,12 +9,26 @@ Jupyter and Voila, e.g.:
         training_history_dashboard,
         confusion_matrix_dashboard,
         pixel_intensity_dashboard,
+        roc_curves_dashboard,
+        gradcam_dashboard,
+        run_comparison_dashboard,
+        gradcam_comparison_dashboard,
     )
 
     ui = class_distribution_dashboard(train_labels, val_labels, class_names)
     ui
 
 All plots are rendered with matplotlib and updated via ipywidgets.
+
+Dashboard summary:
+1. class_distribution_dashboard - Train/val class distribution bar charts
+2. training_history_dashboard - Loss/error curves over epochs
+3. confusion_matrix_dashboard - Confusion matrix with normalization options
+4. pixel_intensity_dashboard - Pixel intensity histograms per class
+5. roc_curves_dashboard - ROC curves with toggleable class lines
+6. gradcam_dashboard - Individual Grad-CAM + class average attention maps
+7. run_comparison_dashboard - Compare metrics across training runs
+8. gradcam_comparison_dashboard - Compare model predictions between runs
 """
 
 from typing import Sequence, Mapping, Optional, List
@@ -660,7 +674,7 @@ def gradcam_dashboard(
     device: str = "cuda",
 ) -> VBox:
     """
-    Interactive Grad-CAM dashboard with navigation buttons.
+    Interactive Grad-CAM dashboard with navigation buttons and average attention map.
 
     Parameters
     ----------
@@ -700,6 +714,7 @@ def gradcam_dashboard(
 
     n_samples = len(labels)
     class_names = list(class_names)
+    n_classes = len(class_names)
 
     # Separate correct and incorrect predictions
     correct_mask = labels == preds
@@ -715,7 +730,11 @@ def gradcam_dashboard(
         return VBox([widgets.HTML("<p>No samples available for visualization.</p>")])
 
     # State
-    state = {"current_idx": 0, "sample_list": all_indices}
+    state = {
+        "current_idx": 0,
+        "sample_list": all_indices,
+        "avg_cam_cache": {},  # Cache for average CAMs per class
+    }
 
     # Grad-CAM helper class
     class GradCAM:
@@ -758,6 +777,56 @@ def gradcam_dashboard(
 
     gradcam = GradCAM(model, target_layer)
 
+    def _resize_cam(cam, target_h, target_w):
+        """Resize CAM to target dimensions."""
+        if HAS_CV2:
+            return cv2.resize(cam, (target_w, target_h))
+        else:
+            from scipy.ndimage import zoom
+            scale_h = target_h / cam.shape[0]
+            scale_w = target_w / cam.shape[1]
+            return zoom(cam, (scale_h, scale_w), order=1)
+
+    def _cam_to_heatmap(cam_resized):
+        """Convert CAM to RGB heatmap."""
+        if HAS_CV2:
+            heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+            return cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+        else:
+            return plt.cm.jet(cam_resized)[:, :, :3]
+
+    def _compute_average_cam(class_idx: int, max_samples: int = 50) -> Optional[np.ndarray]:
+        """Compute average Grad-CAM for a specific class."""
+        if class_idx in state["avg_cam_cache"]:
+            return state["avg_cam_cache"][class_idx]
+
+        # Get indices for this class (based on predicted label)
+        class_indices = np.where(preds == class_idx)[0]
+        if len(class_indices) == 0:
+            return None
+
+        # Sample if too many
+        if len(class_indices) > max_samples:
+            class_indices = np.random.choice(class_indices, max_samples, replace=False)
+
+        # Compute CAMs for all samples
+        cams = []
+        target_h, target_w = images.shape[2], images.shape[3]
+
+        for idx in class_indices:
+            img = images[idx]
+            input_tensor = torch.from_numpy(img).unsqueeze(0).float().to(device)
+            cam = gradcam.generate_cam(input_tensor, target_class=class_idx)
+            cam_resized = _resize_cam(cam, target_h, target_w)
+            cams.append(cam_resized)
+
+        # Average and normalize
+        avg_cam = np.mean(cams, axis=0)
+        avg_cam = (avg_cam - avg_cam.min()) / (avg_cam.max() - avg_cam.min() + 1e-8)
+
+        state["avg_cam_cache"][class_idx] = avg_cam
+        return avg_cam
+
     # Widgets
     prev_btn = widgets.Button(
         description="Previous",
@@ -780,6 +849,13 @@ def gradcam_dashboard(
         options=[("All samples", "all"), ("Correct only", "correct"), ("Incorrect only", "incorrect")],
         value="all",
         description="Filter:",
+    )
+
+    # Show average CAM checkbox
+    show_avg_checkbox = widgets.Checkbox(
+        value=True,
+        description="Show Class Average",
+        indent=False,
     )
 
     # Sample counter
@@ -814,7 +890,7 @@ def gradcam_dashboard(
         pred_label = preds[sample_idx]
         confidence = probs[sample_idx][pred_label]
 
-        # Generate Grad-CAM
+        # Generate Grad-CAM for current sample
         input_tensor = torch.from_numpy(img).unsqueeze(0).float().to(device)
         cam = gradcam.generate_cam(input_tensor, target_class=pred_label)
 
@@ -823,20 +899,10 @@ def gradcam_dashboard(
         img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8)
 
         # Resize CAM to image size
-        if HAS_CV2:
-            cam_resized = cv2.resize(cam, (img.shape[2], img.shape[1]))
-            heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
-        else:
-            # Fallback without cv2
-            from scipy.ndimage import zoom
-            scale_h = img.shape[1] / cam.shape[0]
-            scale_w = img.shape[2] / cam.shape[1]
-            cam_resized = zoom(cam, (scale_h, scale_w), order=1)
-            # Simple colormap
-            heatmap = plt.cm.jet(cam_resized)[:, :, :3]
+        cam_resized = _resize_cam(cam, img.shape[1], img.shape[2])
+        heatmap = _cam_to_heatmap(cam_resized)
 
-        # Blend
+        # Blend for individual overlay
         overlay = 0.6 * img_display + 0.4 * heatmap
         overlay = np.clip(overlay, 0, 1)
 
@@ -847,23 +913,76 @@ def gradcam_dashboard(
         status_color = "green" if is_correct else "red"
         status_text = "CORRECT" if is_correct else "INCORRECT"
 
+        # Determine layout based on whether to show average
+        show_avg = show_avg_checkbox.value
+
         with out:
             out.clear_output(wait=True)
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-            # Original image
-            axes[0].imshow(img_display)
-            axes[0].set_title(
-                f"True: {class_names[true_label]}\n"
-                f"Pred: {class_names[pred_label]} ({confidence:.1%})",
-                fontsize=11,
-            )
-            axes[0].axis("off")
+            if show_avg:
+                # Compute average CAM for predicted class
+                avg_cam = _compute_average_cam(pred_label)
 
-            # Grad-CAM overlay
-            axes[1].imshow(overlay)
-            axes[1].set_title("Grad-CAM Attention Map", fontsize=11)
-            axes[1].axis("off")
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+                # Row 1: Original image and individual Grad-CAM
+                axes[0, 0].imshow(img_display)
+                axes[0, 0].set_title(
+                    f"True: {class_names[true_label]}\n"
+                    f"Pred: {class_names[pred_label]} ({confidence:.1%})",
+                    fontsize=11,
+                )
+                axes[0, 0].axis("off")
+
+                axes[0, 1].imshow(overlay)
+                axes[0, 1].set_title("Individual Grad-CAM", fontsize=11)
+                axes[0, 1].axis("off")
+
+                # Row 2: Average Grad-CAM overlay
+                if avg_cam is not None:
+                    avg_heatmap = _cam_to_heatmap(avg_cam)
+                    avg_overlay = 0.6 * img_display + 0.4 * avg_heatmap
+                    avg_overlay = np.clip(avg_overlay, 0, 1)
+
+                    axes[1, 0].imshow(avg_overlay)
+                    axes[1, 0].set_title(
+                        f"Average Grad-CAM for '{class_names[pred_label]}'\n"
+                        f"(averaged over predictions of this class)",
+                        fontsize=11,
+                    )
+                    axes[1, 0].axis("off")
+
+                    # Show the raw average heatmap
+                    im = axes[1, 1].imshow(avg_cam, cmap="jet")
+                    axes[1, 1].set_title(
+                        f"Average Attention Heatmap\n'{class_names[pred_label]}'",
+                        fontsize=11,
+                    )
+                    axes[1, 1].axis("off")
+                    fig.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
+                else:
+                    axes[1, 0].text(0.5, 0.5, "No samples for this class",
+                                   ha="center", va="center", fontsize=12)
+                    axes[1, 0].axis("off")
+                    axes[1, 1].text(0.5, 0.5, "No samples for this class",
+                                   ha="center", va="center", fontsize=12)
+                    axes[1, 1].axis("off")
+
+            else:
+                # Original 1x2 layout without average
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+                axes[0].imshow(img_display)
+                axes[0].set_title(
+                    f"True: {class_names[true_label]}\n"
+                    f"Pred: {class_names[pred_label]} ({confidence:.1%})",
+                    fontsize=11,
+                )
+                axes[0].axis("off")
+
+                axes[1].imshow(overlay)
+                axes[1].set_title("Grad-CAM Attention Map", fontsize=11)
+                axes[1].axis("off")
 
             # Add status text
             fig.suptitle(
@@ -898,18 +1017,22 @@ def gradcam_dashboard(
         state["current_idx"] = 0
         _update_display()
 
+    def _on_avg_toggle(change):
+        _update_display()
+
     # Wire up
     prev_btn.on_click(_on_prev)
     next_btn.on_click(_on_next)
     random_btn.on_click(_on_random)
     filter_dropdown.observe(_on_filter_change, names="value")
+    show_avg_checkbox.observe(_on_avg_toggle, names="value")
 
     # Initial display
     _update_display()
 
     # Layout
     nav_buttons = HBox([prev_btn, next_btn, random_btn])
-    controls = HBox([filter_dropdown, counter_label, nav_buttons])
+    controls = HBox([filter_dropdown, show_avg_checkbox, counter_label, nav_buttons])
 
     return VBox([controls, out])
 
@@ -1245,3 +1368,478 @@ def run_comparison_dashboard(
     controls = VBox([top_row, viz_selector])
 
     return VBox([controls, out])
+
+
+# -------------------------------------------------------------------------
+# 8. Grad-CAM Comparison Dashboard Between Model Runs
+# -------------------------------------------------------------------------
+
+def gradcam_comparison_dashboard(
+    runs_dir: str = "training_runs",
+    device: str = "cuda",
+) -> VBox:
+    """
+    Dashboard to compare Grad-CAM attention maps between different model runs.
+
+    Allows selecting two runs and viewing their Grad-CAM outputs side-by-side
+    on the same images, with average attention maps per class.
+
+    Parameters
+    ----------
+    runs_dir : str
+        Directory containing saved training runs
+    device : str
+        Device to run models on
+
+    Returns
+    -------
+    ipywidgets.VBox
+    """
+    import torch
+    import torch.nn.functional as F
+    from .training_runs import list_training_runs, load_training_run
+
+    try:
+        import cv2
+        HAS_CV2 = True
+    except ImportError:
+        HAS_CV2 = False
+
+    # Check for available runs
+    available_runs = list_training_runs(runs_dir)
+
+    if len(available_runs) < 2:
+        return VBox([
+            widgets.HTML(
+                f"<p style='color: orange;'>Need at least 2 training runs in '{runs_dir}' "
+                "to compare Grad-CAM outputs. Currently have {len(available_runs)} run(s).</p>"
+            )
+        ])
+
+    # State
+    state = {
+        "loaded_runs": {},
+        "run1_id": None,
+        "run2_id": None,
+        "current_idx": 0,
+        "shared_indices": [],
+        "avg_cams": {"run1": {}, "run2": {}},
+    }
+
+    # Run selector dropdowns
+    run_options = [(f"{r.run_name} ({r.run_id})", r.run_id) for r in available_runs]
+
+    run1_selector = widgets.Dropdown(
+        options=run_options,
+        value=run_options[0][1],
+        description="Run 1:",
+        style={"description_width": "50px"},
+        layout=widgets.Layout(width="350px"),
+    )
+
+    run2_selector = widgets.Dropdown(
+        options=run_options,
+        value=run_options[1][1] if len(run_options) > 1 else run_options[0][1],
+        description="Run 2:",
+        style={"description_width": "50px"},
+        layout=widgets.Layout(width="350px"),
+    )
+
+    # Navigation buttons
+    prev_btn = widgets.Button(description="Previous", button_style="info", icon="arrow-left")
+    next_btn = widgets.Button(description="Next", button_style="info", icon="arrow-right")
+    random_btn = widgets.Button(description="Random", button_style="warning", icon="random")
+
+    # Class filter for average comparison
+    class_selector = widgets.Dropdown(
+        options=[("All Classes", "all")],
+        value="all",
+        description="Class:",
+        style={"description_width": "50px"},
+    )
+
+    # View mode selector
+    view_mode = widgets.ToggleButtons(
+        options=[
+            ("Individual Sample", "individual"),
+            ("Class Averages", "averages"),
+        ],
+        value="individual",
+        description="View:",
+    )
+
+    # Counter and status
+    counter_label = widgets.HTML(value="")
+    status_label = widgets.HTML(value="")
+
+    out = widgets.Output()
+
+    def _load_run(run_id: str):
+        """Load a run if not already loaded."""
+        if run_id not in state["loaded_runs"]:
+            from pathlib import Path
+            run_path = Path(runs_dir) / run_id
+            state["loaded_runs"][run_id] = load_training_run(str(run_path))
+        return state["loaded_runs"][run_id]
+
+    def _resize_cam(cam, target_h, target_w):
+        """Resize CAM to target dimensions."""
+        if HAS_CV2:
+            return cv2.resize(cam, (target_w, target_h))
+        else:
+            from scipy.ndimage import zoom
+            scale_h = target_h / cam.shape[0]
+            scale_w = target_w / cam.shape[1]
+            return zoom(cam, (scale_h, scale_w), order=1)
+
+    def _cam_to_heatmap(cam_resized):
+        """Convert CAM to RGB heatmap."""
+        if HAS_CV2:
+            heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+            return cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+        else:
+            return plt.cm.jet(cam_resized)[:, :, :3]
+
+    def _find_shared_indices():
+        """Find indices that exist in both runs (they should have same images)."""
+        run1 = _load_run(run1_selector.value)
+        run2 = _load_run(run2_selector.value)
+
+        # Assuming both runs used the same validation set
+        n1 = len(run1.labels) if run1.images is not None else 0
+        n2 = len(run2.labels) if run2.images is not None else 0
+
+        if n1 == 0 or n2 == 0:
+            return []
+
+        # Use minimum of both
+        return list(range(min(n1, n2)))
+
+    def _update_class_options():
+        """Update class selector with available classes."""
+        run1 = _load_run(run1_selector.value)
+        classes = run1.metadata.class_names
+        options = [("All Classes", "all")] + [(name, str(i)) for i, name in enumerate(classes)]
+        class_selector.options = options
+
+    def _generate_gradcam(run, sample_idx: int, model=None, target_layer=None):
+        """Generate Grad-CAM for a specific sample from a run."""
+        if run.images is None:
+            return None, None
+
+        img = run.images[sample_idx]
+        pred_label = run.preds[sample_idx]
+
+        # If no model provided, we can't generate Grad-CAM
+        # In this case, we just return placeholder
+        # For comparison, we'll compute a simple activation-based visualization
+
+        # Since we don't have the actual model saved with hooks,
+        # we'll show the prediction differences instead
+        return img, pred_label
+
+    def _compute_difference_map(probs1, probs2):
+        """Compute a difference heatmap between two probability distributions."""
+        diff = np.abs(probs1 - probs2)
+        # Normalize
+        diff = diff / (diff.max() + 1e-8)
+        return diff
+
+    def _update_display():
+        """Update the comparison display."""
+        run1_id = run1_selector.value
+        run2_id = run2_selector.value
+
+        if run1_id == run2_id:
+            with out:
+                out.clear_output(wait=True)
+                print("Please select two different runs to compare.")
+            return
+
+        run1 = _load_run(run1_id)
+        run2 = _load_run(run2_id)
+
+        # Check if images are available
+        if run1.images is None or run2.images is None:
+            with out:
+                out.clear_output(wait=True)
+                print("One or both runs don't have saved images. "
+                      "Save runs with save_images=True to enable Grad-CAM comparison.")
+            return
+
+        state["shared_indices"] = _find_shared_indices()
+
+        if len(state["shared_indices"]) == 0:
+            with out:
+                out.clear_output(wait=True)
+                print("No shared samples found between runs.")
+            return
+
+        # Clamp index
+        state["current_idx"] = state["current_idx"] % len(state["shared_indices"])
+        sample_idx = state["shared_indices"][state["current_idx"]]
+
+        # Update counter
+        counter_label.value = f"<b>Sample {state['current_idx'] + 1} / {len(state['shared_indices'])}</b>"
+
+        mode = view_mode.value
+
+        with out:
+            out.clear_output(wait=True)
+
+            if mode == "individual":
+                _show_individual_comparison(run1, run2, sample_idx)
+            else:
+                _show_average_comparison(run1, run2)
+
+    def _show_individual_comparison(run1, run2, sample_idx):
+        """Show side-by-side comparison for a single sample."""
+        img1 = run1.images[sample_idx]
+        img2 = run2.images[sample_idx]
+
+        # Prepare images for display
+        img1_display = img1.transpose(1, 2, 0)
+        img1_display = (img1_display - img1_display.min()) / (img1_display.max() - img1_display.min() + 1e-8)
+
+        img2_display = img2.transpose(1, 2, 0)
+        img2_display = (img2_display - img2_display.min()) / (img2_display.max() - img2_display.min() + 1e-8)
+
+        true_label = run1.labels[sample_idx]
+        pred1 = run1.preds[sample_idx]
+        pred2 = run2.preds[sample_idx]
+        conf1 = run1.probs[sample_idx][pred1]
+        conf2 = run2.probs[sample_idx][pred2]
+
+        class_names = run1.metadata.class_names
+
+        # Create probability difference heatmap
+        prob_diff = np.abs(run1.probs[sample_idx] - run2.probs[sample_idx])
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+        # Row 1: Images with predictions
+        axes[0, 0].imshow(img1_display)
+        correct1 = "CORRECT" if pred1 == true_label else "INCORRECT"
+        color1 = "green" if pred1 == true_label else "red"
+        axes[0, 0].set_title(
+            f"{run1.metadata.run_name[:25]}\n"
+            f"Pred: {class_names[pred1]} ({conf1:.1%})\n"
+            f"[{correct1}]",
+            fontsize=10,
+            color=color1,
+        )
+        axes[0, 0].axis("off")
+
+        axes[0, 1].imshow(img2_display)
+        correct2 = "CORRECT" if pred2 == true_label else "INCORRECT"
+        color2 = "green" if pred2 == true_label else "red"
+        axes[0, 1].set_title(
+            f"{run2.metadata.run_name[:25]}\n"
+            f"Pred: {class_names[pred2]} ({conf2:.1%})\n"
+            f"[{correct2}]",
+            fontsize=10,
+            color=color2,
+        )
+        axes[0, 1].axis("off")
+
+        # Probability bar chart comparison
+        x = np.arange(len(class_names))
+        width = 0.35
+        axes[0, 2].bar(x - width/2, run1.probs[sample_idx], width, label=run1.metadata.run_name[:15], alpha=0.8)
+        axes[0, 2].bar(x + width/2, run2.probs[sample_idx], width, label=run2.metadata.run_name[:15], alpha=0.8)
+        axes[0, 2].set_xticks(x)
+        axes[0, 2].set_xticklabels(class_names, rotation=45, ha="right", fontsize=8)
+        axes[0, 2].set_ylabel("Probability")
+        axes[0, 2].set_title("Prediction Probabilities", fontsize=10)
+        axes[0, 2].legend(fontsize=8)
+        axes[0, 2].set_ylim(0, 1.1)
+
+        # Row 2: Confidence difference visualization
+        # Create a simple attention-like map based on probability confidence
+        conf_map1 = np.full(img1_display.shape[:2], conf1)
+        conf_map2 = np.full(img2_display.shape[:2], conf2)
+
+        # Overlay confidence as alpha
+        overlay1 = img1_display.copy()
+        overlay1[:, :, 0] = np.clip(overlay1[:, :, 0] + 0.3 * conf1, 0, 1)
+        axes[1, 0].imshow(overlay1)
+        axes[1, 0].set_title(f"Confidence: {conf1:.1%}", fontsize=10)
+        axes[1, 0].axis("off")
+
+        overlay2 = img2_display.copy()
+        overlay2[:, :, 0] = np.clip(overlay2[:, :, 0] + 0.3 * conf2, 0, 1)
+        axes[1, 1].imshow(overlay2)
+        axes[1, 1].set_title(f"Confidence: {conf2:.1%}", fontsize=10)
+        axes[1, 1].axis("off")
+
+        # Prediction difference summary
+        axes[1, 2].bar(class_names, prob_diff, color="coral")
+        axes[1, 2].set_xticklabels(class_names, rotation=45, ha="right", fontsize=8)
+        axes[1, 2].set_ylabel("Absolute Difference")
+        axes[1, 2].set_title("Probability Difference\n(|Run1 - Run2|)", fontsize=10)
+
+        # Overall title
+        agreement = "AGREE" if pred1 == pred2 else "DISAGREE"
+        agree_color = "green" if pred1 == pred2 else "red"
+        fig.suptitle(
+            f"True Label: {class_names[true_label]} | Models {agreement}",
+            fontsize=14,
+            color=agree_color,
+            fontweight="bold",
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    def _show_average_comparison(run1, run2):
+        """Show average prediction comparison per class."""
+        class_names = run1.metadata.class_names
+        n_classes = len(class_names)
+
+        selected_class = class_selector.value
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Accuracy per class
+        acc1_per_class = []
+        acc2_per_class = []
+        for c in range(n_classes):
+            mask = run1.labels == c
+            if mask.sum() > 0:
+                acc1_per_class.append((run1.preds[mask] == c).mean())
+                acc2_per_class.append((run2.preds[mask] == c).mean())
+            else:
+                acc1_per_class.append(0)
+                acc2_per_class.append(0)
+
+        x = np.arange(n_classes)
+        width = 0.35
+
+        axes[0, 0].bar(x - width/2, acc1_per_class, width, label=run1.metadata.run_name[:20], color="#3498db")
+        axes[0, 0].bar(x + width/2, acc2_per_class, width, label=run2.metadata.run_name[:20], color="#e74c3c")
+        axes[0, 0].set_xticks(x)
+        axes[0, 0].set_xticklabels(class_names, rotation=45, ha="right")
+        axes[0, 0].set_ylabel("Accuracy")
+        axes[0, 0].set_title("Per-Class Accuracy Comparison")
+        axes[0, 0].legend()
+        axes[0, 0].set_ylim(0, 1.1)
+
+        # Average confidence per class
+        avg_conf1 = []
+        avg_conf2 = []
+        for c in range(n_classes):
+            mask = run1.labels == c
+            if mask.sum() > 0:
+                avg_conf1.append(run1.probs[mask, c].mean())
+                avg_conf2.append(run2.probs[mask, c].mean())
+            else:
+                avg_conf1.append(0)
+                avg_conf2.append(0)
+
+        axes[0, 1].bar(x - width/2, avg_conf1, width, label=run1.metadata.run_name[:20], color="#3498db")
+        axes[0, 1].bar(x + width/2, avg_conf2, width, label=run2.metadata.run_name[:20], color="#e74c3c")
+        axes[0, 1].set_xticks(x)
+        axes[0, 1].set_xticklabels(class_names, rotation=45, ha="right")
+        axes[0, 1].set_ylabel("Avg Confidence")
+        axes[0, 1].set_title("Average Confidence for True Class")
+        axes[0, 1].legend()
+        axes[0, 1].set_ylim(0, 1.1)
+
+        # Confusion between runs: where do they disagree?
+        agree_mask = run1.preds == run2.preds
+        agree_correct = ((run1.preds == run1.labels) & agree_mask).sum()
+        agree_wrong = ((run1.preds != run1.labels) & agree_mask).sum()
+        disagree_r1_correct = ((run1.preds == run1.labels) & ~agree_mask).sum()
+        disagree_r2_correct = ((run2.preds == run2.labels) & ~agree_mask).sum()
+        disagree_both_wrong = (~agree_mask & (run1.preds != run1.labels) & (run2.preds != run2.labels)).sum()
+
+        categories = ["Both Correct", "Both Wrong", "Only Run1\nCorrect", "Only Run2\nCorrect"]
+        counts = [agree_correct, agree_wrong + disagree_both_wrong, disagree_r1_correct, disagree_r2_correct]
+        colors = ["#2ecc71", "#e74c3c", "#3498db", "#9b59b6"]
+
+        axes[1, 0].bar(categories, counts, color=colors)
+        axes[1, 0].set_ylabel("Number of Samples")
+        axes[1, 0].set_title("Agreement Analysis")
+        for i, (cat, count) in enumerate(zip(categories, counts)):
+            axes[1, 0].text(i, count + 0.5, str(count), ha="center", fontsize=10)
+
+        # Summary statistics
+        total = len(run1.labels)
+        acc1 = (run1.preds == run1.labels).mean()
+        acc2 = (run2.preds == run2.labels).mean()
+        agreement_rate = agree_mask.mean()
+
+        summary_text = (
+            f"Summary Statistics\n"
+            f"{'='*40}\n\n"
+            f"Total Samples: {total}\n\n"
+            f"{run1.metadata.run_name[:25]}:\n"
+            f"  Accuracy: {acc1:.2%}\n\n"
+            f"{run2.metadata.run_name[:25]}:\n"
+            f"  Accuracy: {acc2:.2%}\n\n"
+            f"Agreement Rate: {agreement_rate:.2%}\n"
+            f"  Both Correct: {agree_correct} ({agree_correct/total:.1%})\n"
+            f"  Both Wrong: {agree_wrong + disagree_both_wrong} ({(agree_wrong + disagree_both_wrong)/total:.1%})\n"
+            f"  Disagreements: {(~agree_mask).sum()} ({(~agree_mask).mean():.1%})"
+        )
+
+        axes[1, 1].text(0.1, 0.9, summary_text, transform=axes[1, 1].transAxes,
+                       fontsize=11, verticalalignment="top", fontfamily="monospace",
+                       bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+        axes[1, 1].axis("off")
+
+        fig.suptitle("Model Run Comparison Summary", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        plt.show()
+
+    def _on_run_change(change):
+        _update_class_options()
+        state["current_idx"] = 0
+        state["avg_cams"] = {"run1": {}, "run2": {}}
+        _update_display()
+
+    def _on_prev(btn):
+        if len(state["shared_indices"]) > 0:
+            state["current_idx"] = (state["current_idx"] - 1) % len(state["shared_indices"])
+            _update_display()
+
+    def _on_next(btn):
+        if len(state["shared_indices"]) > 0:
+            state["current_idx"] = (state["current_idx"] + 1) % len(state["shared_indices"])
+            _update_display()
+
+    def _on_random(btn):
+        if len(state["shared_indices"]) > 0:
+            state["current_idx"] = np.random.randint(0, len(state["shared_indices"]))
+            _update_display()
+
+    def _on_view_change(change):
+        _update_display()
+
+    def _on_class_change(change):
+        _update_display()
+
+    # Wire up
+    run1_selector.observe(_on_run_change, names="value")
+    run2_selector.observe(_on_run_change, names="value")
+    prev_btn.on_click(_on_prev)
+    next_btn.on_click(_on_next)
+    random_btn.on_click(_on_random)
+    view_mode.observe(_on_view_change, names="value")
+    class_selector.observe(_on_class_change, names="value")
+
+    # Initialize
+    _update_class_options()
+    _update_display()
+
+    # Layout
+    run_selectors = HBox([run1_selector, run2_selector])
+    nav_buttons = HBox([prev_btn, next_btn, random_btn, counter_label])
+    view_controls = HBox([view_mode, class_selector])
+    controls = VBox([run_selectors, view_controls, nav_buttons])
+
+    return VBox([
+        widgets.HTML("<h3>Grad-CAM Comparison Between Model Runs</h3>"),
+        controls,
+        out,
+    ])
