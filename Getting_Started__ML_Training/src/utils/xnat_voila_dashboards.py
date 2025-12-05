@@ -342,6 +342,10 @@ def pixel_intensity_dashboard(
     """
     Dashboard to inspect pixel intensity distributions.
 
+    Shows two histograms:
+      1. Full intensity range
+      2. Zoomed to a percentile range (default 1–99%)
+
     Parameters
     ----------
     images : np.ndarray
@@ -349,6 +353,8 @@ def pixel_intensity_dashboard(
         For RGB, intensities are flattened across channels.
     labels : sequence of int, optional
         Class labels (len = N). If provided, per-class histograms are available.
+    n_bins : int
+        Number of histogram bins.
     """
     imgs = np.asarray(images)
     if imgs.ndim == 4:
@@ -361,6 +367,7 @@ def pixel_intensity_dashboard(
 
     labels_np = _ensure_numpy(labels) if labels is not None else None
 
+    # --- Class selector ------------------------------------------------------
     if labels_np is not None:
         unique_classes = np.unique(labels_np)
         unique_classes = np.sort(unique_classes)
@@ -380,9 +387,21 @@ def pixel_intensity_dashboard(
         class_names = None
         unique_classes = None
 
+    # --- Percentile zoom slider ---------------------------------------------
+    perc_slider = widgets.IntRangeSlider(
+        value=[1, 99],
+        min=0,
+        max=100,
+        step=1,
+        description="Zoom %:",
+        continuous_update=False,
+        layout=widgets.Layout(width="50%"),
+    )
+
     out = widgets.Output()
 
     def _update(change=None):
+        # Select subset
         if labels_np is not None and class_selector.value != "all":
             c = int(class_selector.value)
             mask = labels_np == c
@@ -393,33 +412,64 @@ def pixel_intensity_dashboard(
         pixels = data.reshape(-1)
         pixels = pixels[np.isfinite(pixels)]
 
+        # Optional subsample if insane number of pixels
+        max_samples = 1_000_000
+        if pixels.size > max_samples:
+            idx = np.random.choice(pixels.size, max_samples, replace=False)
+            pixels = pixels[idx]
+
         with out:
             out.clear_output(wait=True)
-            fig, ax = plt.subplots(figsize=(6, 4))
+            fig, (ax_full, ax_zoom) = plt.subplots(
+                2, 1, figsize=(7, 6), sharex=False
+            )
 
+            # --- Full range ---------------------------------------------------
             if pixels.size == 0:
-                ax.hist([0], bins=1)
+                ax_full.hist([0], bins=1)
             else:
-                ax.hist(pixels, bins=n_bins, alpha=0.8)
+                ax_full.hist(pixels, bins=n_bins, alpha=0.8)
+            ax_full.set_title("Pixel intensity histogram – full range")
+            ax_full.set_ylabel("Count")
 
-            if labels_np is not None and class_selector.value != "all":
-                c = int(class_selector.value)
-                cname = class_names[unique_classes.tolist().index(c)]
-                title = f"Pixel intensity histogram – class {cname}"
+            # --- Zoomed range (percentiles) ----------------------------------
+            if pixels.size > 0:
+                low_p, high_p = perc_slider.value
+                vmin, vmax = np.percentile(pixels, [low_p, high_p])
+                # Avoid degenerate range
+                if vmin == vmax:
+                    vmin -= 1e-6
+                    vmax += 1e-6
+                ax_zoom.hist(
+                    pixels,
+                    bins=n_bins,
+                    range=(vmin, vmax),
+                    alpha=0.8,
+                )
+                ax_zoom.set_title(
+                    f"Zoomed histogram – {low_p}–{high_p} percentile "
+                    f"({vmin:.3f} to {vmax:.3f})"
+                )
             else:
-                title = "Pixel intensity histogram – all images"
+                ax_zoom.hist([0], bins=1)
+                ax_zoom.set_title("Zoomed histogram – no data")
 
-            ax.set_title(title)
-            ax.set_xlabel("Pixel intensity")
-            ax.set_ylabel("Count")
+            ax_zoom.set_xlabel("Pixel intensity")
+            ax_zoom.set_ylabel("Count")
+
             plt.tight_layout()
             plt.show()
 
+    # Wire interactions
     if class_selector is not None:
         class_selector.observe(_update, names="value")
-        controls = HBox([class_selector])
+        controls_top = HBox([class_selector, perc_slider])
     else:
-        controls = HBox([])
+        controls_top = HBox([perc_slider])
 
+    perc_slider.observe(_update, names="value")
+
+    # Initial render
     _update()
-    return VBox([controls, out])
+
+    return VBox([controls_top, out])

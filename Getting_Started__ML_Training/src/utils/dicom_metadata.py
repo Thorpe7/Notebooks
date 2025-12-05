@@ -10,7 +10,6 @@ import pydicom
 
 
 # DICOM tags we care about for dashboarding
-# (add/remove fields as needed)
 DICOM_TAGS = {
     "PatientID": ("0010", "0020"),
     "PatientSex": ("0010", "0040"),
@@ -26,7 +25,6 @@ DICOM_TAGS = {
 
 
 def _safe_get(ds: pydicom.dataset.Dataset, name: str) -> Optional[str]:
-    """Return str(ds.<name>) or None if missing."""
     value = getattr(ds, name, None)
     if value is None:
         return None
@@ -38,41 +36,52 @@ def _safe_get(ds: pydicom.dataset.Dataset, name: str) -> Optional[str]:
 
 def _parse_xnat_path(path: Path) -> Dict[str, Any]:
     """
-    Parse subject/session/scan info from an XNAT archive-style path.
+    Parse XNAT project / experiment / scan info from a path like:
 
-    Expected pattern (example):
-      <root>/<subject_archive>/<subject_label>/<session_label>/
-          scans/<scan_dir>/resources/DICOM/<file>.dcm
+      /data/projects/<PROJECT_ID>/
+          experiments/<EXPERIMENT_LABEL>/
+              SCANS/<SCAN_DIR>/secondary/<file>.dcm
 
-    We locate the 'scans' component and work backwards from there.
+    Example:
+      /data/projects/00001/experiments/22580520_BIRADS_5_2935194931/
+          SCANS/1_2_826_0_1_3680043_.../secondary/22580520_...dcm
     """
     parts = list(path.parts)
     info: Dict[str, Any] = {
-        "xnat_subject_label": None,
-        "xnat_session_label": None,
+        "xnat_project_id": None,
+        "xnat_experiment_label": None,
         "xnat_scan_dir": None,
         "xnat_scan_id": None,
-        "xnat_scan_description": None,
+        "xnat_scan_uid": None,
     }
 
-    if "scans" in parts:
-        idx = parts.index("scans")
-        if idx + 1 < len(parts):
-            scan_dir = parts[idx + 1]  # e.g. '1-ep2d_perf_12_CC_BOLUS'
-            info["xnat_scan_dir"] = scan_dir
-            # split leading numeric ID from description if present
-            if "-" in scan_dir:
-                first, *rest = scan_dir.split("-", 1)
-                if first.isdigit():
-                    info["xnat_scan_id"] = int(first)
-                    info["xnat_scan_description"] = rest[0] if rest else None
-                else:
-                    info["xnat_scan_description"] = scan_dir
+    # project
+    if "projects" in parts:
+        idx_proj = parts.index("projects")
+        if idx_proj + 1 < len(parts):
+            info["xnat_project_id"] = parts[idx_proj + 1]
 
-        if idx - 1 >= 0:
-            info["xnat_session_label"] = parts[idx - 1]  # e.g. 'Test_Subject_999_MR1'
-        if idx - 2 >= 0:
-            info["xnat_subject_label"] = parts[idx - 2]  # e.g. 'Test_Subject_999'
+    # experiment
+    if "experiments" in parts:
+        idx_exp = parts.index("experiments")
+        if idx_exp + 1 < len(parts):
+            info["xnat_experiment_label"] = parts[idx_exp + 1]
+
+    # scan directory
+    if "SCANS" in parts:
+        idx_scans = parts.index("SCANS")
+        if idx_scans + 1 < len(parts):
+            scan_dir = parts[idx_scans + 1]
+            info["xnat_scan_dir"] = scan_dir
+
+            # Example scan_dir: "1_2_826_0_1_3680043_..." -> first token is scan ID
+            tokens = scan_dir.split("_", 1)
+            if tokens and tokens[0].isdigit():
+                info["xnat_scan_id"] = int(tokens[0])
+                if len(tokens) > 1:
+                    info["xnat_scan_uid"] = tokens[1]
+            else:
+                info["xnat_scan_uid"] = scan_dir
 
     return info
 
@@ -81,22 +90,7 @@ def extract_dicom_metadata(
     dcm_path: Path,
     extra_tags: Iterable[str] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Extract a single-row dict of metadata from one DICOM file.
-
-    Parameters
-    ----------
-    dcm_path : Path
-        Path to a .dcm file.
-    extra_tags : iterable of attribute names, optional
-        Additional pydicom attribute names to pull out, if needed.
-
-    Returns
-    -------
-    dict
-        Dictionary with core DICOM tags + parsed XNAT path fields + file_path.
-    """
-    # Only read headers, skip pixel data to keep it fast
+    """Extract a single-row dict of metadata from one DICOM file."""
     ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
 
     record: Dict[str, Any] = {
@@ -128,20 +122,6 @@ def collect_dicom_metadata(
     """
     Walk `root_dir` recursively, collect metadata from all .dcm files,
     and return a pandas DataFrame.
-
-    Parameters
-    ----------
-    root_dir : str or Path
-        Root directory of the XNAT archive (or any DICOM tree).
-    extra_tags : iterable of attribute names, optional
-        Extra pydicom Dataset attributes to include.
-    max_files : int, optional
-        If not None, stop after this many files (useful for quick tests).
-
-    Returns
-    -------
-    pandas.DataFrame
-        One row per DICOM file with XNAT path fields + DICOM metadata.
     """
     root = Path(root_dir)
     records: List[Dict[str, Any]] = []
