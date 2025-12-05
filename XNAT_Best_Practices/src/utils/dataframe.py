@@ -100,7 +100,6 @@ def build_project_dataframe(
 
     with xnat.connect(**conn_params) as session:
         records = collect_project_metadata(session, project_id)
-        print(records)
 
     df = pd.DataFrame(records)
 
