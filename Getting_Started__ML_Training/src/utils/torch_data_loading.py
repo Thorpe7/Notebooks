@@ -75,7 +75,8 @@ def load_dicom_data_with_logging(
     data_root: str,          # project id like "00001" (since find_* builds the full path)
     batch_size: int = 32,
     num_workers: int = 2,
-    val_split: float = 0.2
+    val_split: float = 0.2,
+    image_size: int = 224,   # target image size (height and width)
 ) -> Dict[str, DataLoader]:
     log_dir = Path.cwd() / "logs" / "data_loading"
     os.makedirs(log_dir, exist_ok=True)
@@ -95,15 +96,24 @@ def load_dicom_data_with_logging(
     id2label = {i: lbl for lbl, i in label2id.items()}
     targets_remap = [label2id[y] for y in targets_birads]  # now 0..K-1
 
-    # 3) Transforms
+    # 3) Transforms with data augmentation for training
+    # Augmentations help prevent overfitting on small medical imaging datasets
+    # Resize slightly larger than target for random crop
+    resize_size = int(image_size * 1.15)
     train_tf = T.Compose([
-        T.Resize((224, 224), antialias=True),
+        T.Resize((resize_size, resize_size), antialias=True),
+        T.RandomResizedCrop(image_size, scale=(0.8, 1.0), antialias=True),
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomRotation(degrees=15),
+        T.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
         T.ConvertImageDtype(torch.float32),
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     val_tf = T.Compose([
-        T.Resize((224, 224), antialias=True),
+        T.Resize((image_size, image_size), antialias=True),
         T.ConvertImageDtype(torch.float32),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
 
     # 4) Stratified split (use original BI-RADS or remapped—either is fine)
