@@ -148,12 +148,168 @@ def collect_dicom_metadata(
     return df
 
 
+def _extract_dicom_image_metrics(scan_path: Path) -> Dict[str, Any]:
+    """
+    Extract image metrics from the first DICOM file found in a scan directory.
+
+    Parameters
+    ----------
+    scan_path : Path
+        Path to the scan directory (e.g., /data/projects/.../SCANS/1)
+
+    Returns
+    -------
+    dict
+        Dictionary containing image metrics extracted from DICOM headers.
+    """
+    metrics: Dict[str, Any] = {
+        # Image dimensions
+        "rows": None,
+        "columns": None,
+        "num_slices": None,
+        # Pixel spacing and resolution
+        "pixel_spacing_row": None,
+        "pixel_spacing_col": None,
+        "slice_thickness": None,
+        "spacing_between_slices": None,
+        # Image characteristics
+        "bits_allocated": None,
+        "bits_stored": None,
+        "high_bit": None,
+        "pixel_representation": None,
+        "photometric_interpretation": None,
+        "samples_per_pixel": None,
+        # Acquisition parameters
+        "kvp": None,
+        "exposure": None,
+        "exposure_time": None,
+        "tube_current": None,
+        "convolution_kernel": None,
+        "reconstruction_diameter": None,
+        # Window settings
+        "window_center": None,
+        "window_width": None,
+        # Scanner info
+        "manufacturer": None,
+        "manufacturer_model_name": None,
+        "station_name": None,
+        "software_versions": None,
+        # Series info
+        "series_description": None,
+        "series_number": None,
+        "acquisition_number": None,
+        "instance_number": None,
+        # Patient position
+        "patient_position": None,
+        "image_orientation_patient": None,
+        "body_part_examined": None,
+    }
+
+    # Find DICOM files in the scan directory
+    dcm_files = []
+    for subdir in ["DICOM", "secondary", "NIFTI", ""]:
+        search_path = scan_path / subdir if subdir else scan_path
+        if search_path.exists():
+            dcm_files.extend(list(search_path.glob("*.dcm")))
+            if dcm_files:
+                break
+
+    if not dcm_files:
+        return metrics
+
+    # Count total slices
+    metrics["num_slices"] = len(dcm_files)
+
+    # Read the first DICOM file
+    try:
+        ds = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
+    except Exception:
+        return metrics
+
+    # Helper to safely extract values
+    def safe_get(attr: str, default=None):
+        val = getattr(ds, attr, default)
+        if val is None:
+            return default
+        try:
+            # Handle multi-valued attributes
+            if hasattr(val, "__iter__") and not isinstance(val, str):
+                return list(val) if len(val) > 1 else val[0]
+            return val
+        except Exception:
+            return default
+
+    # Image dimensions
+    metrics["rows"] = safe_get("Rows")
+    metrics["columns"] = safe_get("Columns")
+
+    # Pixel spacing
+    pixel_spacing = safe_get("PixelSpacing")
+    if pixel_spacing is not None:
+        if hasattr(pixel_spacing, "__iter__") and not isinstance(pixel_spacing, str):
+            pixel_spacing = list(pixel_spacing)
+            if len(pixel_spacing) >= 2:
+                metrics["pixel_spacing_row"] = float(pixel_spacing[0])
+                metrics["pixel_spacing_col"] = float(pixel_spacing[1])
+        else:
+            metrics["pixel_spacing_row"] = float(pixel_spacing)
+            metrics["pixel_spacing_col"] = float(pixel_spacing)
+
+    metrics["slice_thickness"] = safe_get("SliceThickness")
+    metrics["spacing_between_slices"] = safe_get("SpacingBetweenSlices")
+
+    # Image characteristics
+    metrics["bits_allocated"] = safe_get("BitsAllocated")
+    metrics["bits_stored"] = safe_get("BitsStored")
+    metrics["high_bit"] = safe_get("HighBit")
+    metrics["pixel_representation"] = safe_get("PixelRepresentation")
+    metrics["photometric_interpretation"] = safe_get("PhotometricInterpretation")
+    metrics["samples_per_pixel"] = safe_get("SamplesPerPixel")
+
+    # Acquisition parameters (CT/X-ray specific)
+    metrics["kvp"] = safe_get("KVP")
+    metrics["exposure"] = safe_get("Exposure")
+    metrics["exposure_time"] = safe_get("ExposureTime")
+    metrics["tube_current"] = safe_get("XRayTubeCurrent")
+    metrics["convolution_kernel"] = safe_get("ConvolutionKernel")
+    metrics["reconstruction_diameter"] = safe_get("ReconstructionDiameter")
+
+    # Window settings
+    metrics["window_center"] = safe_get("WindowCenter")
+    metrics["window_width"] = safe_get("WindowWidth")
+
+    # Scanner info
+    metrics["manufacturer"] = safe_get("Manufacturer")
+    metrics["manufacturer_model_name"] = safe_get("ManufacturerModelName")
+    metrics["station_name"] = safe_get("StationName")
+    metrics["software_versions"] = safe_get("SoftwareVersions")
+
+    # Series info
+    metrics["series_description"] = safe_get("SeriesDescription")
+    metrics["series_number"] = safe_get("SeriesNumber")
+    metrics["acquisition_number"] = safe_get("AcquisitionNumber")
+    metrics["instance_number"] = safe_get("InstanceNumber")
+
+    # Patient position
+    metrics["patient_position"] = safe_get("PatientPosition")
+    iop = safe_get("ImageOrientationPatient")
+    if iop is not None:
+        if hasattr(iop, "__iter__") and not isinstance(iop, str):
+            metrics["image_orientation_patient"] = ",".join(str(x) for x in iop)
+        else:
+            metrics["image_orientation_patient"] = str(iop)
+    metrics["body_part_examined"] = safe_get("BodyPartExamined")
+
+    return metrics
+
+
 def fetch_xnat_metadata(
     project_id: str,
     connection: Optional[xnat.XNATSession] = None,
     host: Optional[str] = None,
     user: Optional[str] = None,
     password: Optional[str] = None,
+    include_dicom_metrics: bool = True,
 ) -> pd.DataFrame:
     """
     Fetch demographic and DICOM metadata from an XNAT project using XNATpy.
@@ -176,30 +332,65 @@ def fetch_xnat_metadata(
         XNAT username. Defaults to XNAT_USER environment variable.
     password : str, optional
         XNAT password. Defaults to XNAT_PASS environment variable.
+    include_dicom_metrics : bool, default True
+        If True, reads a sample DICOM file from each scan to extract additional
+        image metrics (resolution, pixel spacing, bits, acquisition parameters, etc.).
+        Set to False for faster metadata retrieval when image metrics aren't needed.
 
     Returns
     -------
     pd.DataFrame
         A DataFrame containing subject demographics and scan metadata with columns:
+
+        Subject fields:
         - subject_id: XNAT subject ID
         - subject_label: Subject label
         - gender: Subject gender (if available)
         - age: Subject age (if available)
         - handedness: Subject handedness (if available)
+
+        Experiment fields:
         - experiment_id: XNAT experiment/session ID
         - experiment_label: Experiment label
         - experiment_date: Date of the experiment
         - modality: Imaging modality
+
+        Scan fields:
         - scan_id: Scan ID within the experiment
         - scan_type: Type/series description of the scan
         - scan_quality: Quality rating of the scan
         - scan_note: Notes associated with the scan
-        - file_path: Mounted file path to the DICOM data
+        - file_path: Mounted file path to the scan's DICOM directory
+        - dicom_file_count: Number of DICOM files found via XNATpy
+        - dicom_files_sample: List of up to 3 sample DICOM file paths
+
+        Image metrics (when include_dicom_metrics=True):
+        - rows, columns: Image dimensions in pixels
+        - num_slices: Number of DICOM files/slices in the scan
+        - pixel_spacing_row, pixel_spacing_col: Pixel spacing in mm
+        - slice_thickness: Slice thickness in mm
+        - spacing_between_slices: Distance between slices in mm
+        - bits_allocated, bits_stored, high_bit: Bit depth information
+        - pixel_representation: 0=unsigned, 1=signed
+        - photometric_interpretation: e.g., MONOCHROME2, RGB
+        - samples_per_pixel: Number of samples per pixel
+        - kvp: Peak kilovoltage (CT/X-ray)
+        - exposure, exposure_time, tube_current: X-ray exposure parameters
+        - convolution_kernel: Reconstruction kernel (CT)
+        - reconstruction_diameter: Reconstruction diameter in mm
+        - window_center, window_width: Default window settings
+        - manufacturer, manufacturer_model_name: Scanner info
+        - station_name, software_versions: Station info
+        - series_description, series_number: Series info
+        - patient_position, body_part_examined: Positioning info
 
     Examples
     --------
     Using environment variables (recommended for XNAT Jupyter):
     >>> df = fetch_xnat_metadata("00001")
+
+    Fast retrieval without DICOM metrics:
+    >>> df = fetch_xnat_metadata("00001", include_dicom_metrics=False)
 
     Using an existing connection:
     >>> conn = xnat.connect(host, user=user, password=password)
@@ -273,13 +464,52 @@ def fetch_xnat_metadata(
                         "scan_note": getattr(scan, "note", None),
                     }
 
-                    # Build the mounted file path
-                    # Standard XNAT mount path structure
-                    file_path = (
-                        f"/data/projects/{project_id}/experiments/"
-                        f"{experiment.label}/SCANS/{scan.id}"
-                    )
-                    scan_record["file_path"] = file_path
+                    # Get file paths from XNATpy resources
+                    dicom_files: List[str] = []
+                    scan_dir_path = None
+
+                    # Iterate through resources (DICOM, secondary, etc.)
+                    try:
+                        for resource in scan.resources.values():
+                            resource_label = getattr(resource, "label", "")
+                            for file_obj in resource.files.values():
+                                # Get the URI which maps to the mounted path
+                                file_uri = getattr(file_obj, "uri", None)
+                                if file_uri:
+                                    # Convert URI to mounted path
+                                    # URI format: /data/experiments/.../scans/.../resources/.../files/...
+                                    # Mounted path: /data/projects/.../experiments/.../SCANS/.../DICOM/...
+                                    file_path = f"/data{file_uri}" if not file_uri.startswith("/data") else file_uri
+
+                                    # Check if it's a DICOM file
+                                    if file_path.lower().endswith(".dcm"):
+                                        dicom_files.append(file_path)
+
+                                        # Extract the scan directory from the first file
+                                        if scan_dir_path is None:
+                                            scan_dir_path = str(Path(file_path).parent)
+                    except Exception:
+                        # Fall back to constructed path if resource iteration fails
+                        pass
+
+                    # Fall back to constructed path if no files found via XNATpy
+                    if scan_dir_path is None:
+                        scan_dir_path = (
+                            f"/data/projects/{project_id}/experiments/"
+                            f"{experiment.label}/SCANS/{scan.id}"
+                        )
+
+                    scan_record["file_path"] = scan_dir_path
+                    scan_record["dicom_file_count"] = len(dicom_files) if dicom_files else None
+
+                    # Store first few DICOM file paths for reference
+                    if dicom_files:
+                        scan_record["dicom_files_sample"] = dicom_files[:3]
+
+                    # Extract DICOM image metrics if requested
+                    if include_dicom_metrics:
+                        dicom_metrics = _extract_dicom_image_metrics(Path(scan_dir_path))
+                        scan_record.update(dicom_metrics)
 
                     records.append(scan_record)
 
