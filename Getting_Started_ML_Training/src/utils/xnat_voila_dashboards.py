@@ -1860,17 +1860,19 @@ def metadata_filter_dashboard(
     """
     Interactive dashboard to filter XNAT metadata and create data subsets.
 
-    Allows users to filter by any column in the DataFrame using dropdown
-    selectors, with automatic detection of categorical vs numeric columns.
-    Displays histogram distributions and pie charts for the filtered data.
+    Features a professional layout with:
+    - Header with progress/summary statistics
+    - Visualizations and data preview in the main area
+    - Collapsible control panel for filtering on the left side
+    - User-selectable filter columns
 
     Parameters
     ----------
     df : pd.DataFrame
         The metadata DataFrame from fetch_xnat_metadata().
     filter_columns : list of str, optional
-        Specific columns to use for filtering. If None, automatically selects
-        appropriate columns based on data types and cardinality.
+        Initial columns to use for filtering. Users can add/remove columns
+        dynamically through the interface.
     on_filter_callback : callable, optional
         A callback function that receives the filtered DataFrame whenever
         the filters change. Useful for chaining with other processing.
@@ -1900,55 +1902,63 @@ def metadata_filter_dashboard(
             )
         ])
 
-    # State to hold current filtered DataFrame
+    # State to hold current filtered DataFrame and active filters
     state = {
         "filtered_df": df.copy(),
         "original_df": df.copy(),
+        "active_filter_columns": [],
     }
 
-    # Determine which columns to use for filtering
-    def _get_filter_columns(dataframe: pd.DataFrame) -> List[str]:
-        """Select appropriate columns for filtering."""
-        if filter_columns is not None:
-            return [c for c in filter_columns if c in dataframe.columns]
-
+    # -------------------------------------------------------------------------
+    # Helper: Get all filterable columns
+    # -------------------------------------------------------------------------
+    def _get_all_filterable_columns(dataframe: pd.DataFrame) -> List[str]:
+        """Get all columns that could potentially be used for filtering."""
         candidates = []
         for col in dataframe.columns:
             # Skip certain columns that aren't useful for filtering
             if col in ["dicom_files_sample", "file_path", "image_orientation_patient"]:
                 continue
-
             # Skip columns with all null values
             if dataframe[col].isna().all():
                 continue
-
             # For object/string columns, check cardinality
             if dataframe[col].dtype == "object" or str(dataframe[col].dtype) == "category":
                 n_unique = dataframe[col].nunique()
-                # Only include if reasonable number of unique values
-                if 1 < n_unique <= 50:
-                    candidates.append(col)
-            # For numeric columns, include if they have reasonable range
-            elif np.issubdtype(dataframe[col].dtype, np.number):
-                n_unique = dataframe[col].nunique()
                 if 1 < n_unique <= 100:
                     candidates.append(col)
+            # For numeric columns
+            elif np.issubdtype(dataframe[col].dtype, np.number):
+                n_unique = dataframe[col].nunique()
+                if 1 < n_unique <= 500:
+                    candidates.append(col)
+        return candidates
 
-        # Prioritize certain columns if available
+    # -------------------------------------------------------------------------
+    # Helper: Get default filter columns
+    # -------------------------------------------------------------------------
+    def _get_default_filter_columns(dataframe: pd.DataFrame) -> List[str]:
+        """Select default columns for filtering."""
+        if filter_columns is not None:
+            return [c for c in filter_columns if c in dataframe.columns]
+
+        all_cols = _get_all_filterable_columns(dataframe)
+
+        # Prioritize certain columns
         priority = [
             "project_name", "project_id", "modality", "gender", "scan_type",
             "manufacturer", "body_part_examined", "photometric_interpretation",
             "bits_stored", "rows", "columns", "num_slices"
         ]
-        ordered = [c for c in priority if c in candidates]
-        ordered += [c for c in candidates if c not in ordered]
+        ordered = [c for c in priority if c in all_cols]
+        ordered += [c for c in all_cols if c not in ordered]
 
-        # Limit to reasonable number
-        return ordered[:10]
+        return ordered[:6]  # Start with 6 default filters
 
-    available_columns = _get_filter_columns(df)
+    all_filterable_columns = _get_all_filterable_columns(df)
+    state["active_filter_columns"] = _get_default_filter_columns(df)
 
-    if not available_columns:
+    if not all_filterable_columns:
         return VBox([
             widgets.HTML(
                 "<p style='color: orange;'>No suitable columns found for filtering. "
@@ -1956,13 +1966,15 @@ def metadata_filter_dashboard(
             )
         ])
 
-    # Create filter widgets for each column
+    # -------------------------------------------------------------------------
+    # Filter widget creation and management
+    # -------------------------------------------------------------------------
     filter_widgets = {}
+    filter_container = VBox()
 
-    def _create_filter_widget(col: str) -> widgets.Widget:
+    def _create_filter_widget(col: str) -> Optional[widgets.Widget]:
         """Create appropriate filter widget based on column type."""
         col_data = df[col].dropna()
-
         if col_data.empty:
             return None
 
@@ -1972,9 +1984,8 @@ def metadata_filter_dashboard(
             widget = widgets.SelectMultiple(
                 options=["(All)"] + unique_vals,
                 value=["(All)"],
-                description=col[:15] + ":" if len(col) > 15 else col + ":",
-                style={"description_width": "120px"},
-                layout=widgets.Layout(width="250px", height="80px"),
+                description="",
+                layout=widgets.Layout(width="100%", height="100px"),
             )
             return widget
 
@@ -1987,9 +1998,8 @@ def metadata_filter_dashboard(
                 widget = widgets.SelectMultiple(
                     options=["(All)"] + unique_vals_str,
                     value=["(All)"],
-                    description=col[:15] + ":" if len(col) > 15 else col + ":",
-                    style={"description_width": "120px"},
-                    layout=widgets.Layout(width="250px", height="80px"),
+                    description="",
+                    layout=widgets.Layout(width="100%", height="100px"),
                 )
                 return widget
             else:
@@ -2002,118 +2012,156 @@ def metadata_filter_dashboard(
                     min=min_val,
                     max=max_val,
                     step=step,
-                    description=col[:15] + ":" if len(col) > 15 else col + ":",
-                    style={"description_width": "120px"},
-                    layout=widgets.Layout(width="400px"),
+                    description="",
+                    layout=widgets.Layout(width="100%"),
                     continuous_update=False,
                 )
                 return widget
-
         return None
 
-    # Create widgets for each filter column
-    for col in available_columns:
-        widget = _create_filter_widget(col)
-        if widget is not None:
-            filter_widgets[col] = widget
+    def _rebuild_filter_widgets():
+        """Rebuild filter widgets based on active columns."""
+        # Clear existing
+        filter_widgets.clear()
 
-    # Reset button
-    reset_btn = widgets.Button(
-        description="Reset All Filters",
-        button_style="warning",
-        icon="refresh",
-        layout=widgets.Layout(width="150px"),
+        filter_boxes = []
+        for col in state["active_filter_columns"]:
+            widget = _create_filter_widget(col)
+            if widget is not None:
+                filter_widgets[col] = widget
+                widget.observe(_update, names="value")
+
+                # Create a labeled box for this filter
+                label = widgets.HTML(
+                    f"<div style='background: #2c3e50; color: white; padding: 5px 10px; "
+                    f"border-radius: 4px 4px 0 0; font-weight: bold; font-size: 12px;'>"
+                    f"{col.replace('_', ' ').title()}</div>"
+                )
+                filter_box = VBox(
+                    [label, widget],
+                    layout=widgets.Layout(
+                        border="1px solid #bdc3c7",
+                        border_radius="4px",
+                        margin="5px 0",
+                    )
+                )
+                filter_boxes.append(filter_box)
+
+        filter_container.children = filter_boxes
+
+    # -------------------------------------------------------------------------
+    # Column selector for adding/removing filters
+    # -------------------------------------------------------------------------
+    available_to_add = [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
+
+    add_filter_dropdown = widgets.Dropdown(
+        options=[("+ Add Filter...", "")] + [(c.replace("_", " ").title(), c) for c in available_to_add],
+        value="",
+        layout=widgets.Layout(width="100%"),
     )
 
-    # Export button
-    export_btn = widgets.Button(
-        description="Export Filtered CSV",
-        button_style="success",
-        icon="download",
-        layout=widgets.Layout(width="150px"),
-    )
+    def _on_add_filter(change):
+        if change["new"] and change["new"] not in state["active_filter_columns"]:
+            state["active_filter_columns"].append(change["new"])
+            # Update dropdown options
+            available = [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
+            add_filter_dropdown.options = [("+ Add Filter...", "")] + [(c.replace("_", " ").title(), c) for c in available]
+            add_filter_dropdown.value = ""
+            _rebuild_filter_widgets()
+            _update()
 
-    # Summary statistics display
-    summary_html = widgets.HTML(value="")
+    add_filter_dropdown.observe(_on_add_filter, names="value")
 
-    # Plot selector
-    plot_selector = widgets.ToggleButtons(
-        options=[
-            ("Distributions", "dist"),
-            ("Pie Charts", "pie"),
-            ("Numeric Histograms", "hist"),
-        ],
-        value="dist",
-        description="View:",
-    )
+    # -------------------------------------------------------------------------
+    # Summary statistics cards (header area)
+    # -------------------------------------------------------------------------
+    summary_cards_html = widgets.HTML(value="")
 
-    # Column selector for detailed view
-    detail_col_selector = widgets.Dropdown(
-        options=[(c, c) for c in available_columns],
-        value=available_columns[0] if available_columns else None,
-        description="Detail Col:",
-        style={"description_width": "80px"},
-        layout=widgets.Layout(width="250px"),
-    )
-
-    # Output areas
-    out_plots = widgets.Output()
-    out_table = widgets.Output()
-
-    def _apply_filters() -> pd.DataFrame:
-        """Apply all current filter selections to the DataFrame."""
-        filtered = state["original_df"].copy()
-
-        for col, widget in filter_widgets.items():
-            if isinstance(widget, widgets.SelectMultiple):
-                selected = list(widget.value)
-                if "(All)" not in selected and selected:
-                    # Convert back to original dtype for comparison
-                    if np.issubdtype(df[col].dtype, np.number):
-                        selected_vals = [float(v) for v in selected]
-                        filtered = filtered[filtered[col].isin(selected_vals) | filtered[col].isna()]
-                    else:
-                        filtered = filtered[filtered[col].astype(str).isin(selected) | filtered[col].isna()]
-
-            elif isinstance(widget, widgets.FloatRangeSlider):
-                min_val, max_val = widget.value
-                filtered = filtered[
-                    (filtered[col] >= min_val) & (filtered[col] <= max_val) |
-                    filtered[col].isna()
-                ]
-
-        return filtered
-
-    def _update_summary(filtered: pd.DataFrame):
-        """Update the summary statistics HTML."""
+    def _update_summary_cards(filtered: pd.DataFrame):
+        """Update the summary statistics cards at the top."""
         total = len(state["original_df"])
         filtered_count = len(filtered)
         pct = (filtered_count / total * 100) if total > 0 else 0
 
-        # Count unique values for key columns
-        unique_stats = []
-        for col in ["project_name", "subject_id", "experiment_id", "scan_id"]:
-            if col in filtered.columns:
-                n = filtered[col].nunique()
-                unique_stats.append(f"<b>{col.replace('_', ' ').title()}s:</b> {n}")
+        # Count unique values
+        n_projects = filtered["project_name"].nunique() if "project_name" in filtered.columns else 0
+        n_subjects = filtered["subject_id"].nunique() if "subject_id" in filtered.columns else 0
+        n_experiments = filtered["experiment_id"].nunique() if "experiment_id" in filtered.columns else 0
+        n_scans = filtered["scan_id"].nunique() if "scan_id" in filtered.columns else 0
 
-        unique_html = " | ".join(unique_stats) if unique_stats else ""
+        # Progress bar width
+        progress_pct = min(100, pct)
 
         html = f"""
-        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 10px 0;">
-            <h4 style="margin-top: 0;">Filter Summary</h4>
-            <p><b>Total Records:</b> {total} | <b>Filtered:</b> {filtered_count} ({pct:.1f}%)</p>
-            <p>{unique_html}</p>
+        <div style="background: linear-gradient(135deg, #1a365d 0%, #2c5282 100%);
+                    padding: 20px; border-radius: 8px; margin-bottom: 15px; color: white;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <div>
+                    <h2 style="margin: 0; font-size: 24px;">XNAT Metadata Filter Dashboard</h2>
+                    <p style="margin: 5px 0 0 0; opacity: 0.8; font-size: 14px;">
+                        Filter and explore imaging metadata across projects
+                    </p>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-size: 32px; font-weight: bold;">{filtered_count:,} / {total:,}</div>
+                    <div style="font-size: 12px; opacity: 0.8;">Records Selected ({pct:.1f}%)</div>
+                </div>
+            </div>
+            <div style="background: rgba(255,255,255,0.2); border-radius: 4px; height: 8px; margin-bottom: 15px;">
+                <div style="background: #48bb78; height: 100%; border-radius: 4px; width: {progress_pct}%;"></div>
+            </div>
+            <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                <div style="background: rgba(255,255,255,0.15); padding: 15px 25px; border-radius: 6px; text-align: center; flex: 1; min-width: 120px;">
+                    <div style="font-size: 28px; font-weight: bold;">{n_projects}</div>
+                    <div style="font-size: 12px; opacity: 0.8;">PROJECTS</div>
+                </div>
+                <div style="background: rgba(255,255,255,0.15); padding: 15px 25px; border-radius: 6px; text-align: center; flex: 1; min-width: 120px;">
+                    <div style="font-size: 28px; font-weight: bold;">{n_subjects}</div>
+                    <div style="font-size: 12px; opacity: 0.8;">SUBJECTS</div>
+                </div>
+                <div style="background: rgba(255,255,255,0.15); padding: 15px 25px; border-radius: 6px; text-align: center; flex: 1; min-width: 120px;">
+                    <div style="font-size: 28px; font-weight: bold;">{n_experiments}</div>
+                    <div style="font-size: 12px; opacity: 0.8;">SESSIONS</div>
+                </div>
+                <div style="background: rgba(255,255,255,0.15); padding: 15px 25px; border-radius: 6px; text-align: center; flex: 1; min-width: 120px;">
+                    <div style="font-size: 28px; font-weight: bold;">{n_scans}</div>
+                    <div style="font-size: 12px; opacity: 0.8;">SCANS</div>
+                </div>
+            </div>
         </div>
         """
-        summary_html.value = html
+        summary_cards_html.value = html
+
+    # -------------------------------------------------------------------------
+    # Visualization outputs
+    # -------------------------------------------------------------------------
+    out_plots = widgets.Output()
+    out_table = widgets.Output()
+
+    # Plot type selector
+    plot_selector = widgets.ToggleButtons(
+        options=[
+            ("Distributions", "dist"),
+            ("Pie Charts", "pie"),
+            ("Histograms", "hist"),
+            ("Data Table", "table"),
+        ],
+        value="dist",
+        layout=widgets.Layout(margin="0 0 10px 0"),
+    )
 
     def _plot_distributions(filtered: pd.DataFrame):
         """Plot distribution bar charts for categorical columns."""
-        # Select columns with reasonable cardinality
-        plot_cols = [c for c in available_columns
+        plot_cols = [c for c in state["active_filter_columns"]
                     if c in filtered.columns and
                     (filtered[c].dtype == "object" or filtered[c].nunique() <= 20)][:6]
+
+        # Add extra categorical columns if we don't have enough
+        if len(plot_cols) < 4:
+            extra = [c for c in all_filterable_columns
+                    if c in filtered.columns and c not in plot_cols and
+                    (filtered[c].dtype == "object" or filtered[c].nunique() <= 15)]
+            plot_cols.extend(extra[:6 - len(plot_cols)])
 
         if not plot_cols:
             print("No suitable categorical columns for distribution plots.")
@@ -2122,7 +2170,7 @@ def metadata_filter_dashboard(
         n_cols = min(3, len(plot_cols))
         n_rows = (len(plot_cols) + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3.5 * n_rows))
         if n_rows == 1 and n_cols == 1:
             axes = np.array([[axes]])
         elif n_rows == 1:
@@ -2130,26 +2178,30 @@ def metadata_filter_dashboard(
         elif n_cols == 1:
             axes = axes.reshape(-1, 1)
 
+        colors_palette = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6",
+                         "#1abc9c", "#e67e22", "#34495e", "#16a085", "#c0392b"]
+
         for idx, col in enumerate(plot_cols):
             row, col_idx = divmod(idx, n_cols)
             ax = axes[row, col_idx]
 
-            value_counts = filtered[col].value_counts().head(10)
-            colors = plt.cm.Set3(np.linspace(0, 1, len(value_counts)))
+            value_counts = filtered[col].value_counts().head(8)
+            colors = [colors_palette[i % len(colors_palette)] for i in range(len(value_counts))]
 
             bars = ax.barh(range(len(value_counts)), value_counts.values, color=colors)
             ax.set_yticks(range(len(value_counts)))
-            ax.set_yticklabels([str(v)[:20] for v in value_counts.index], fontsize=9)
-            ax.set_xlabel("Count")
-            ax.set_title(col.replace("_", " ").title(), fontsize=11)
+            ax.set_yticklabels([str(v)[:25] for v in value_counts.index], fontsize=9)
+            ax.set_xlabel("Count", fontsize=10)
+            ax.set_title(col.replace("_", " ").title(), fontsize=11, fontweight="bold")
             ax.invert_yaxis()
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
 
-            # Add count labels
             for bar, count in zip(bars, value_counts.values):
-                ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
-                       str(count), va="center", fontsize=8)
+                ax.text(bar.get_width() + max(value_counts) * 0.02,
+                       bar.get_y() + bar.get_height()/2,
+                       f"{count:,}", va="center", fontsize=9)
 
-        # Hide empty subplots
         for idx in range(len(plot_cols), n_rows * n_cols):
             row, col_idx = divmod(idx, n_cols)
             axes[row, col_idx].axis("off")
@@ -2160,15 +2212,15 @@ def metadata_filter_dashboard(
     def _plot_pie_charts(filtered: pd.DataFrame):
         """Plot pie charts for key categorical columns."""
         pie_cols = [c for c in ["project_name", "modality", "gender", "manufacturer",
-                                "body_part_examined", "scan_type"]
-                   if c in filtered.columns and filtered[c].nunique() <= 10][:4]
+                                "body_part_examined", "scan_type", "photometric_interpretation"]
+                   if c in filtered.columns and 1 < filtered[c].nunique() <= 10][:4]
 
         if not pie_cols:
-            pie_cols = [c for c in available_columns
-                       if c in filtered.columns and filtered[c].nunique() <= 10][:4]
+            pie_cols = [c for c in all_filterable_columns
+                       if c in filtered.columns and 1 < filtered[c].nunique() <= 10][:4]
 
         if not pie_cols:
-            print("No suitable columns for pie charts (need columns with ≤10 unique values).")
+            print("No suitable columns for pie charts (need columns with 2-10 unique values).")
             return
 
         n_cols = min(2, len(pie_cols))
@@ -2182,33 +2234,35 @@ def metadata_filter_dashboard(
         elif n_cols == 1:
             axes = axes.reshape(-1, 1)
 
+        colors_palette = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6",
+                         "#1abc9c", "#e67e22", "#34495e", "#16a085", "#c0392b"]
+
         for idx, col in enumerate(pie_cols):
             row, col_idx = divmod(idx, n_cols)
             ax = axes[row, col_idx]
 
             value_counts = filtered[col].value_counts()
-            colors = plt.cm.Pastel1(np.linspace(0, 1, len(value_counts)))
+            colors = [colors_palette[i % len(colors_palette)] for i in range(len(value_counts))]
 
             wedges, texts, autotexts = ax.pie(
                 value_counts.values,
-                labels=[str(v)[:15] for v in value_counts.index],
+                labels=None,
                 autopct=lambda p: f"{p:.1f}%" if p > 5 else "",
                 colors=colors,
                 startangle=90,
+                pctdistance=0.75,
             )
-            ax.set_title(col.replace("_", " ").title(), fontsize=12)
+            ax.set_title(col.replace("_", " ").title(), fontsize=12, fontweight="bold")
 
-            # Add legend if many categories
-            if len(value_counts) > 5:
-                ax.legend(
-                    wedges,
-                    [f"{v}: {c}" for v, c in zip(value_counts.index, value_counts.values)],
-                    loc="center left",
-                    bbox_to_anchor=(1, 0.5),
-                    fontsize=8,
-                )
+            # Add legend
+            ax.legend(
+                wedges,
+                [f"{str(v)[:20]}: {c:,}" for v, c in zip(value_counts.index, value_counts.values)],
+                loc="center left",
+                bbox_to_anchor=(1, 0.5),
+                fontsize=9,
+            )
 
-        # Hide empty subplots
         for idx in range(len(pie_cols), n_rows * n_cols):
             row, col_idx = divmod(idx, n_cols)
             axes[row, col_idx].axis("off")
@@ -2218,19 +2272,18 @@ def metadata_filter_dashboard(
 
     def _plot_numeric_histograms(filtered: pd.DataFrame):
         """Plot histograms for numeric columns."""
-        numeric_cols = [c for c in available_columns
-                       if c in filtered.columns and
+        numeric_cols = ["rows", "columns", "num_slices", "pixel_spacing_row",
+                       "pixel_spacing_col", "slice_thickness", "age", "bits_stored",
+                       "window_center", "window_width"]
+        numeric_cols = [c for c in numeric_cols if c in filtered.columns and
                        np.issubdtype(filtered[c].dtype, np.number) and
-                       filtered[c].nunique() > 5][:6]
+                       filtered[c].nunique() > 2][:6]
 
-        # Add additional useful numeric columns if available
-        extra_numeric = ["rows", "columns", "num_slices", "pixel_spacing_row",
-                        "slice_thickness", "bits_stored", "age"]
-        for col in extra_numeric:
-            if col in filtered.columns and col not in numeric_cols:
-                if np.issubdtype(filtered[col].dtype, np.number):
-                    numeric_cols.append(col)
-        numeric_cols = numeric_cols[:6]
+        if not numeric_cols:
+            numeric_cols = [c for c in all_filterable_columns
+                          if c in filtered.columns and
+                          np.issubdtype(filtered[c].dtype, np.number) and
+                          filtered[c].nunique() > 5][:6]
 
         if not numeric_cols:
             print("No numeric columns available for histograms.")
@@ -2239,7 +2292,7 @@ def metadata_filter_dashboard(
         n_cols = min(3, len(numeric_cols))
         n_rows = (len(numeric_cols) + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3.5 * n_rows))
         if n_rows == 1 and n_cols == 1:
             axes = np.array([[axes]])
         elif n_rows == 1:
@@ -2254,17 +2307,22 @@ def metadata_filter_dashboard(
             data = filtered[col].dropna()
             if len(data) > 0:
                 ax.hist(data, bins=30, color="#3498db", edgecolor="white", alpha=0.8)
-                ax.axvline(data.mean(), color="red", linestyle="--", label=f"Mean: {data.mean():.2f}")
-                ax.axvline(data.median(), color="green", linestyle="--", label=f"Median: {data.median():.2f}")
-                ax.set_xlabel(col.replace("_", " ").title())
-                ax.set_ylabel("Count")
-                ax.set_title(f"{col.replace('_', ' ').title()}\n(n={len(data)})", fontsize=11)
-                ax.legend(fontsize=8)
+                ax.axvline(data.mean(), color="#e74c3c", linestyle="--", linewidth=2,
+                          label=f"Mean: {data.mean():.2f}")
+                ax.axvline(data.median(), color="#2ecc71", linestyle="--", linewidth=2,
+                          label=f"Median: {data.median():.2f}")
+                ax.set_xlabel(col.replace("_", " ").title(), fontsize=10)
+                ax.set_ylabel("Count", fontsize=10)
+                ax.set_title(f"{col.replace('_', ' ').title()} (n={len(data):,})",
+                           fontsize=11, fontweight="bold")
+                ax.legend(fontsize=8, loc="upper right")
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
             else:
-                ax.text(0.5, 0.5, "No data", ha="center", va="center")
-                ax.set_title(col.replace("_", " ").title())
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=12)
+                ax.set_title(col.replace("_", " ").title(), fontweight="bold")
+                ax.axis("off")
 
-        # Hide empty subplots
         for idx in range(len(numeric_cols), n_rows * n_cols):
             row, col_idx = divmod(idx, n_cols)
             axes[row, col_idx].axis("off")
@@ -2277,23 +2335,55 @@ def metadata_filter_dashboard(
         with out_table:
             out_table.clear_output(wait=True)
 
-            # Show first few rows
             display_cols = [c for c in filtered.columns
-                          if c not in ["dicom_files_sample", "image_orientation_patient"]][:12]
+                          if c not in ["dicom_files_sample", "image_orientation_patient"]][:15]
 
             if len(filtered) > 0:
-                sample = filtered[display_cols].head(10)
-                print(f"Showing first {len(sample)} of {len(filtered)} filtered records:\n")
+                sample = filtered[display_cols].head(15)
+                # Style the dataframe
+                print(f"Showing {len(sample)} of {len(filtered):,} filtered records\n")
                 display(sample)
             else:
                 print("No records match the current filters.")
 
+    # -------------------------------------------------------------------------
+    # Apply filters
+    # -------------------------------------------------------------------------
+    def _apply_filters() -> pd.DataFrame:
+        """Apply all current filter selections to the DataFrame."""
+        filtered = state["original_df"].copy()
+
+        for col, widget in filter_widgets.items():
+            if col not in filtered.columns:
+                continue
+
+            if isinstance(widget, widgets.SelectMultiple):
+                selected = list(widget.value)
+                if "(All)" not in selected and selected:
+                    if np.issubdtype(df[col].dtype, np.number):
+                        selected_vals = [float(v) for v in selected]
+                        filtered = filtered[filtered[col].isin(selected_vals) | filtered[col].isna()]
+                    else:
+                        filtered = filtered[filtered[col].astype(str).isin(selected) | filtered[col].isna()]
+
+            elif isinstance(widget, widgets.FloatRangeSlider):
+                min_val, max_val = widget.value
+                filtered = filtered[
+                    ((filtered[col] >= min_val) & (filtered[col] <= max_val)) |
+                    filtered[col].isna()
+                ]
+
+        return filtered
+
+    # -------------------------------------------------------------------------
+    # Main update function
+    # -------------------------------------------------------------------------
     def _update(change=None):
         """Main update function triggered by any filter change."""
         filtered = _apply_filters()
         state["filtered_df"] = filtered
 
-        _update_summary(filtered)
+        _update_summary_cards(filtered)
 
         with out_plots:
             out_plots.clear_output(wait=True)
@@ -2308,12 +2398,32 @@ def metadata_filter_dashboard(
                     _plot_pie_charts(filtered)
                 elif plot_type == "hist":
                     _plot_numeric_histograms(filtered)
+                elif plot_type == "table":
+                    _update_table(filtered)
 
-        _update_table(filtered)
+        # Always update table in background for callback
+        if plot_selector.value != "table":
+            _update_table(filtered)
 
-        # Call callback if provided
         if on_filter_callback is not None:
             on_filter_callback(filtered)
+
+    # -------------------------------------------------------------------------
+    # Button handlers
+    # -------------------------------------------------------------------------
+    reset_btn = widgets.Button(
+        description="Reset Filters",
+        button_style="warning",
+        icon="refresh",
+        layout=widgets.Layout(width="100%", margin="5px 0"),
+    )
+
+    export_btn = widgets.Button(
+        description="Export CSV",
+        button_style="success",
+        icon="download",
+        layout=widgets.Layout(width="100%", margin="5px 0"),
+    )
 
     def _reset_filters(btn):
         """Reset all filters to default values."""
@@ -2331,68 +2441,112 @@ def metadata_filter_dashboard(
 
         filtered = state["filtered_df"]
         if len(filtered) == 0:
-            print("No data to export.")
+            with out_table:
+                print("No data to export.")
             return
 
-        # Create export directory
         export_dir = Path("logs/exported_data")
         export_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = export_dir / f"filtered_metadata_{timestamp}.csv"
 
-        # Export (excluding complex columns)
         export_cols = [c for c in filtered.columns if c != "dicom_files_sample"]
         filtered[export_cols].to_csv(filename, index=False)
 
         with out_table:
-            print(f"\n✓ Exported {len(filtered)} records to: {filename}")
+            print(f"\n✓ Exported {len(filtered):,} records to: {filename}")
 
-    # Wire up observers
-    for widget in filter_widgets.values():
-        widget.observe(_update, names="value")
-
-    plot_selector.observe(_update, names="value")
     reset_btn.on_click(_reset_filters)
     export_btn.on_click(_export_csv)
+
+    # -------------------------------------------------------------------------
+    # Wire up observers
+    # -------------------------------------------------------------------------
+    plot_selector.observe(_update, names="value")
+
+    # -------------------------------------------------------------------------
+    # Build initial filter widgets
+    # -------------------------------------------------------------------------
+    _rebuild_filter_widgets()
 
     # Initial render
     _update()
 
-    # Layout
-    # Arrange filter widgets in rows of 3
-    filter_rows = []
-    filter_list = list(filter_widgets.values())
-    for i in range(0, len(filter_list), 3):
-        row_widgets = filter_list[i:i+3]
-        filter_rows.append(HBox(row_widgets, layout=widgets.Layout(margin="5px 0")))
+    # -------------------------------------------------------------------------
+    # Layout: Control Panel (left) + Main Content (right)
+    # -------------------------------------------------------------------------
 
-    filters_box = VBox(
-        filter_rows,
-        layout=widgets.Layout(
-            border="1px solid #ddd",
-            padding="10px",
-            margin="10px 0",
-            border_radius="8px",
-        )
+    # Control panel header
+    control_panel_header = widgets.HTML(
+        """<div style="background: #34495e; color: white; padding: 12px;
+           border-radius: 6px 6px 0 0; font-weight: bold;">
+           <span style="font-size: 14px;">Control Panel</span>
+        </div>"""
     )
 
-    buttons_row = HBox([reset_btn, export_btn], layout=widgets.Layout(margin="10px 0"))
+    # Filter section
+    filter_section_header = widgets.HTML(
+        """<div style="background: #ecf0f1; padding: 8px 12px; font-weight: bold;
+           font-size: 12px; color: #2c3e50; border-bottom: 1px solid #bdc3c7;">
+           Filters
+        </div>"""
+    )
 
-    controls = VBox([
-        widgets.HTML("<h3>XNAT Metadata Filter Dashboard</h3>"),
-        widgets.HTML("<p><i>Select values in each filter to subset the data. "
-                    "Hold Ctrl/Cmd to select multiple values.</i></p>"),
-        filters_box,
-        buttons_row,
-        summary_html,
-        HBox([plot_selector, detail_col_selector]),
-    ])
+    # Control panel content
+    control_panel_content = VBox([
+        filter_section_header,
+        filter_container,
+        add_filter_dropdown,
+        widgets.HTML("<hr style='margin: 10px 0; border-color: #ecf0f1;'>"),
+        reset_btn,
+        export_btn,
+    ], layout=widgets.Layout(
+        padding="0 10px 10px 10px",
+        background="#f8f9fa",
+    ))
 
-    # Create tabs for plots and table
-    tabs = widgets.Tab(children=[out_plots, out_table])
-    tabs.set_title(0, "Visualizations")
-    tabs.set_title(1, "Data Preview")
+    control_panel = VBox([
+        control_panel_header,
+        control_panel_content,
+    ], layout=widgets.Layout(
+        width="280px",
+        border="1px solid #bdc3c7",
+        border_radius="6px",
+        margin="0 15px 0 0",
+    ))
 
-    return VBox([controls, tabs])
+    # Main content area
+    viz_header = widgets.HTML(
+        """<div style="background: #ecf0f1; padding: 10px 15px; border-radius: 6px;
+           margin-bottom: 10px;">
+           <span style="font-weight: bold; color: #2c3e50;">Visualization</span>
+        </div>"""
+    )
+
+    main_content = VBox([
+        plot_selector,
+        out_plots,
+        widgets.HTML("<hr style='margin: 15px 0;'>"),
+        widgets.HTML("<div style='font-weight: bold; margin-bottom: 10px;'>Data Preview</div>"),
+        out_table,
+    ], layout=widgets.Layout(
+        flex="1",
+    ))
+
+    # Main layout: header on top, then control panel + content side by side
+    content_row = HBox([
+        control_panel,
+        main_content,
+    ], layout=widgets.Layout(
+        width="100%",
+    ))
+
+    dashboard = VBox([
+        summary_cards_html,
+        content_row,
+    ], layout=widgets.Layout(
+        width="100%",
+    ))
+
+    return dashboard
