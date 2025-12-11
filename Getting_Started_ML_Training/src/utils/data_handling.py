@@ -310,6 +310,9 @@ def fetch_xnat_metadata(
     user: Optional[str] = None,
     password: Optional[str] = None,
     include_dicom_metrics: bool = True,
+    save_csv: bool = False,
+    csv_filename: Optional[str] = None,
+    save_dir: str = "logs/saved_df",
 ) -> pd.DataFrame:
     """
     Fetch demographic and DICOM metadata from one or more XNAT projects using XNATpy.
@@ -318,6 +321,10 @@ def fetch_xnat_metadata(
     variables) and retrieves subject demographics and scan-level DICOM metadata
     for all experiments in the specified project(s). When multiple projects are
     provided, data from all projects is aggregated into a single DataFrame.
+
+    Supports caching: if save_csv=True and csv_filename is provided, the function
+    will first check if the CSV already exists and load it instead of fetching
+    from XNAT. This is useful for large datasets that take time to fetch.
 
     Parameters
     ----------
@@ -338,6 +345,15 @@ def fetch_xnat_metadata(
         If True, reads a sample DICOM file from each scan to extract additional
         image metrics (resolution, pixel spacing, bits, acquisition parameters, etc.).
         Set to False for faster metadata retrieval when image metrics aren't needed.
+    save_csv : bool, default False
+        If True and csv_filename is provided, saves the DataFrame to a CSV file.
+        On subsequent calls, if the CSV exists, it will be loaded instead of
+        fetching data from XNAT.
+    csv_filename : str, optional
+        Name of the CSV file (with or without .csv extension). Required if
+        save_csv=True. Example: "my_metadata" or "my_metadata.csv"
+    save_dir : str, default "logs/saved_df"
+        Directory where the CSV file will be saved/loaded from.
 
     Returns
     -------
@@ -399,6 +415,14 @@ def fetch_xnat_metadata(
     >>> PROJECTS_LIST = ["00001", "00002", "RIDER-LUNG-CT"]
     >>> df = fetch_xnat_metadata(PROJECTS_LIST, connection=connection)
 
+    Save to CSV and load from cache on subsequent calls:
+    >>> df = fetch_xnat_metadata(
+    ...     ["00001", "00002"],
+    ...     connection=connection,
+    ...     save_csv=True,
+    ...     csv_filename="multi_project_metadata"
+    ... )
+
     Fast retrieval without DICOM metrics:
     >>> df = fetch_xnat_metadata(["00001", "00002"], include_dicom_metrics=False)
 
@@ -415,6 +439,32 @@ def fetch_xnat_metadata(
     ...     password="mypass"
     ... )
     """
+    # Handle CSV caching
+    csv_path = None
+    if save_csv and csv_filename:
+        # Ensure filename has .csv extension
+        if not csv_filename.endswith(".csv"):
+            csv_filename = f"{csv_filename}.csv"
+
+        # Create save directory if it doesn't exist
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        csv_path = save_path / csv_filename
+
+        # Check if cached CSV exists
+        if csv_path.exists():
+            print(f"Loading cached metadata from: {csv_path}")
+            df = pd.read_csv(csv_path)
+
+            # Convert date column if present
+            if "experiment_date" in df.columns:
+                df["experiment_date"] = pd.to_datetime(
+                    df["experiment_date"], errors="coerce"
+                )
+
+            return df
+
     # Normalize project_ids to a list
     if isinstance(project_ids, str):
         project_ids = [project_ids]
@@ -550,6 +600,11 @@ def fetch_xnat_metadata(
         priority_cols = ["project_id", "project_name"]
         other_cols = [c for c in cols if c not in priority_cols]
         df = df[priority_cols + other_cols]
+
+        # Save to CSV if requested
+        if csv_path is not None:
+            df.to_csv(csv_path, index=False)
+            print(f"Saved metadata to: {csv_path}")
 
         return df
 
