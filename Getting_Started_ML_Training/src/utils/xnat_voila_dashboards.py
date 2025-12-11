@@ -13,6 +13,7 @@ Jupyter and Voila, e.g.:
         gradcam_dashboard,
         run_comparison_dashboard,
         gradcam_comparison_dashboard,
+        metadata_filter_dashboard,
     )
 
     ui = class_distribution_dashboard(train_labels, val_labels, class_names)
@@ -29,11 +30,13 @@ Dashboard summary:
 6. gradcam_dashboard - Individual Grad-CAM + class average attention maps
 7. run_comparison_dashboard - Compare metrics across training runs
 8. gradcam_comparison_dashboard - Compare model predictions between runs
+9. metadata_filter_dashboard - Filter and subset XNAT metadata with visualizations
 """
 
-from typing import Sequence, Mapping, Optional, List
+from typing import Sequence, Mapping, Optional, List, Callable
 
 import numpy as np
+import pandas as pd
 import ipywidgets as widgets
 from ipywidgets import VBox, HBox
 import matplotlib.pyplot as plt
@@ -1843,3 +1846,553 @@ def gradcam_comparison_dashboard(
         controls,
         out,
     ])
+
+
+# -------------------------------------------------------------------------
+# 9. Metadata Filter Dashboard
+# -------------------------------------------------------------------------
+
+def metadata_filter_dashboard(
+    df: pd.DataFrame,
+    filter_columns: Optional[List[str]] = None,
+    on_filter_callback: Optional[Callable[[pd.DataFrame], None]] = None,
+) -> VBox:
+    """
+    Interactive dashboard to filter XNAT metadata and create data subsets.
+
+    Allows users to filter by any column in the DataFrame using dropdown
+    selectors, with automatic detection of categorical vs numeric columns.
+    Displays histogram distributions and pie charts for the filtered data.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The metadata DataFrame from fetch_xnat_metadata().
+    filter_columns : list of str, optional
+        Specific columns to use for filtering. If None, automatically selects
+        appropriate columns based on data types and cardinality.
+    on_filter_callback : callable, optional
+        A callback function that receives the filtered DataFrame whenever
+        the filters change. Useful for chaining with other processing.
+
+    Returns
+    -------
+    ipywidgets.VBox
+        The dashboard widget containing filters and visualizations.
+
+    Examples
+    --------
+    >>> from src.utils.xnat_voila_dashboards import metadata_filter_dashboard
+    >>> dashboard = metadata_filter_dashboard(meta_df)
+    >>> dashboard
+
+    With callback to capture filtered data:
+    >>> filtered_data = {}
+    >>> def capture_filter(df):
+    ...     filtered_data['current'] = df
+    >>> dashboard = metadata_filter_dashboard(meta_df, on_filter_callback=capture_filter)
+    """
+    if df is None or df.empty:
+        return VBox([
+            widgets.HTML(
+                "<p style='color: orange;'>No data provided. "
+                "Please pass a valid DataFrame.</p>"
+            )
+        ])
+
+    # State to hold current filtered DataFrame
+    state = {
+        "filtered_df": df.copy(),
+        "original_df": df.copy(),
+    }
+
+    # Determine which columns to use for filtering
+    def _get_filter_columns(dataframe: pd.DataFrame) -> List[str]:
+        """Select appropriate columns for filtering."""
+        if filter_columns is not None:
+            return [c for c in filter_columns if c in dataframe.columns]
+
+        candidates = []
+        for col in dataframe.columns:
+            # Skip certain columns that aren't useful for filtering
+            if col in ["dicom_files_sample", "file_path", "image_orientation_patient"]:
+                continue
+
+            # Skip columns with all null values
+            if dataframe[col].isna().all():
+                continue
+
+            # For object/string columns, check cardinality
+            if dataframe[col].dtype == "object" or str(dataframe[col].dtype) == "category":
+                n_unique = dataframe[col].nunique()
+                # Only include if reasonable number of unique values
+                if 1 < n_unique <= 50:
+                    candidates.append(col)
+            # For numeric columns, include if they have reasonable range
+            elif np.issubdtype(dataframe[col].dtype, np.number):
+                n_unique = dataframe[col].nunique()
+                if 1 < n_unique <= 100:
+                    candidates.append(col)
+
+        # Prioritize certain columns if available
+        priority = [
+            "project_name", "project_id", "modality", "gender", "scan_type",
+            "manufacturer", "body_part_examined", "photometric_interpretation",
+            "bits_stored", "rows", "columns", "num_slices"
+        ]
+        ordered = [c for c in priority if c in candidates]
+        ordered += [c for c in candidates if c not in ordered]
+
+        # Limit to reasonable number
+        return ordered[:10]
+
+    available_columns = _get_filter_columns(df)
+
+    if not available_columns:
+        return VBox([
+            widgets.HTML(
+                "<p style='color: orange;'>No suitable columns found for filtering. "
+                "The DataFrame may have too few categorical columns.</p>"
+            )
+        ])
+
+    # Create filter widgets for each column
+    filter_widgets = {}
+
+    def _create_filter_widget(col: str) -> widgets.Widget:
+        """Create appropriate filter widget based on column type."""
+        col_data = df[col].dropna()
+
+        if col_data.empty:
+            return None
+
+        # For categorical/object columns, use SelectMultiple
+        if df[col].dtype == "object" or str(df[col].dtype) == "category":
+            unique_vals = sorted(col_data.unique().astype(str))
+            widget = widgets.SelectMultiple(
+                options=["(All)"] + unique_vals,
+                value=["(All)"],
+                description=col[:15] + ":" if len(col) > 15 else col + ":",
+                style={"description_width": "120px"},
+                layout=widgets.Layout(width="250px", height="80px"),
+            )
+            return widget
+
+        # For numeric columns with few unique values, use SelectMultiple
+        elif np.issubdtype(df[col].dtype, np.number):
+            n_unique = col_data.nunique()
+            if n_unique <= 20:
+                unique_vals = sorted(col_data.unique())
+                unique_vals_str = [str(v) for v in unique_vals]
+                widget = widgets.SelectMultiple(
+                    options=["(All)"] + unique_vals_str,
+                    value=["(All)"],
+                    description=col[:15] + ":" if len(col) > 15 else col + ":",
+                    style={"description_width": "120px"},
+                    layout=widgets.Layout(width="250px", height="80px"),
+                )
+                return widget
+            else:
+                # Use range slider for continuous numeric
+                min_val = float(col_data.min())
+                max_val = float(col_data.max())
+                step = (max_val - min_val) / 100 if max_val > min_val else 1
+                widget = widgets.FloatRangeSlider(
+                    value=[min_val, max_val],
+                    min=min_val,
+                    max=max_val,
+                    step=step,
+                    description=col[:15] + ":" if len(col) > 15 else col + ":",
+                    style={"description_width": "120px"},
+                    layout=widgets.Layout(width="400px"),
+                    continuous_update=False,
+                )
+                return widget
+
+        return None
+
+    # Create widgets for each filter column
+    for col in available_columns:
+        widget = _create_filter_widget(col)
+        if widget is not None:
+            filter_widgets[col] = widget
+
+    # Reset button
+    reset_btn = widgets.Button(
+        description="Reset All Filters",
+        button_style="warning",
+        icon="refresh",
+        layout=widgets.Layout(width="150px"),
+    )
+
+    # Export button
+    export_btn = widgets.Button(
+        description="Export Filtered CSV",
+        button_style="success",
+        icon="download",
+        layout=widgets.Layout(width="150px"),
+    )
+
+    # Summary statistics display
+    summary_html = widgets.HTML(value="")
+
+    # Plot selector
+    plot_selector = widgets.ToggleButtons(
+        options=[
+            ("Distributions", "dist"),
+            ("Pie Charts", "pie"),
+            ("Numeric Histograms", "hist"),
+        ],
+        value="dist",
+        description="View:",
+    )
+
+    # Column selector for detailed view
+    detail_col_selector = widgets.Dropdown(
+        options=[(c, c) for c in available_columns],
+        value=available_columns[0] if available_columns else None,
+        description="Detail Col:",
+        style={"description_width": "80px"},
+        layout=widgets.Layout(width="250px"),
+    )
+
+    # Output areas
+    out_plots = widgets.Output()
+    out_table = widgets.Output()
+
+    def _apply_filters() -> pd.DataFrame:
+        """Apply all current filter selections to the DataFrame."""
+        filtered = state["original_df"].copy()
+
+        for col, widget in filter_widgets.items():
+            if isinstance(widget, widgets.SelectMultiple):
+                selected = list(widget.value)
+                if "(All)" not in selected and selected:
+                    # Convert back to original dtype for comparison
+                    if np.issubdtype(df[col].dtype, np.number):
+                        selected_vals = [float(v) for v in selected]
+                        filtered = filtered[filtered[col].isin(selected_vals) | filtered[col].isna()]
+                    else:
+                        filtered = filtered[filtered[col].astype(str).isin(selected) | filtered[col].isna()]
+
+            elif isinstance(widget, widgets.FloatRangeSlider):
+                min_val, max_val = widget.value
+                filtered = filtered[
+                    (filtered[col] >= min_val) & (filtered[col] <= max_val) |
+                    filtered[col].isna()
+                ]
+
+        return filtered
+
+    def _update_summary(filtered: pd.DataFrame):
+        """Update the summary statistics HTML."""
+        total = len(state["original_df"])
+        filtered_count = len(filtered)
+        pct = (filtered_count / total * 100) if total > 0 else 0
+
+        # Count unique values for key columns
+        unique_stats = []
+        for col in ["project_name", "subject_id", "experiment_id", "scan_id"]:
+            if col in filtered.columns:
+                n = filtered[col].nunique()
+                unique_stats.append(f"<b>{col.replace('_', ' ').title()}s:</b> {n}")
+
+        unique_html = " | ".join(unique_stats) if unique_stats else ""
+
+        html = f"""
+        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 10px 0;">
+            <h4 style="margin-top: 0;">Filter Summary</h4>
+            <p><b>Total Records:</b> {total} | <b>Filtered:</b> {filtered_count} ({pct:.1f}%)</p>
+            <p>{unique_html}</p>
+        </div>
+        """
+        summary_html.value = html
+
+    def _plot_distributions(filtered: pd.DataFrame):
+        """Plot distribution bar charts for categorical columns."""
+        # Select columns with reasonable cardinality
+        plot_cols = [c for c in available_columns
+                    if c in filtered.columns and
+                    (filtered[c].dtype == "object" or filtered[c].nunique() <= 20)][:6]
+
+        if not plot_cols:
+            print("No suitable categorical columns for distribution plots.")
+            return
+
+        n_cols = min(3, len(plot_cols))
+        n_rows = (len(plot_cols) + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for idx, col in enumerate(plot_cols):
+            row, col_idx = divmod(idx, n_cols)
+            ax = axes[row, col_idx]
+
+            value_counts = filtered[col].value_counts().head(10)
+            colors = plt.cm.Set3(np.linspace(0, 1, len(value_counts)))
+
+            bars = ax.barh(range(len(value_counts)), value_counts.values, color=colors)
+            ax.set_yticks(range(len(value_counts)))
+            ax.set_yticklabels([str(v)[:20] for v in value_counts.index], fontsize=9)
+            ax.set_xlabel("Count")
+            ax.set_title(col.replace("_", " ").title(), fontsize=11)
+            ax.invert_yaxis()
+
+            # Add count labels
+            for bar, count in zip(bars, value_counts.values):
+                ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
+                       str(count), va="center", fontsize=8)
+
+        # Hide empty subplots
+        for idx in range(len(plot_cols), n_rows * n_cols):
+            row, col_idx = divmod(idx, n_cols)
+            axes[row, col_idx].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_pie_charts(filtered: pd.DataFrame):
+        """Plot pie charts for key categorical columns."""
+        pie_cols = [c for c in ["project_name", "modality", "gender", "manufacturer",
+                                "body_part_examined", "scan_type"]
+                   if c in filtered.columns and filtered[c].nunique() <= 10][:4]
+
+        if not pie_cols:
+            pie_cols = [c for c in available_columns
+                       if c in filtered.columns and filtered[c].nunique() <= 10][:4]
+
+        if not pie_cols:
+            print("No suitable columns for pie charts (need columns with ≤10 unique values).")
+            return
+
+        n_cols = min(2, len(pie_cols))
+        n_rows = (len(pie_cols) + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for idx, col in enumerate(pie_cols):
+            row, col_idx = divmod(idx, n_cols)
+            ax = axes[row, col_idx]
+
+            value_counts = filtered[col].value_counts()
+            colors = plt.cm.Pastel1(np.linspace(0, 1, len(value_counts)))
+
+            wedges, texts, autotexts = ax.pie(
+                value_counts.values,
+                labels=[str(v)[:15] for v in value_counts.index],
+                autopct=lambda p: f"{p:.1f}%" if p > 5 else "",
+                colors=colors,
+                startangle=90,
+            )
+            ax.set_title(col.replace("_", " ").title(), fontsize=12)
+
+            # Add legend if many categories
+            if len(value_counts) > 5:
+                ax.legend(
+                    wedges,
+                    [f"{v}: {c}" for v, c in zip(value_counts.index, value_counts.values)],
+                    loc="center left",
+                    bbox_to_anchor=(1, 0.5),
+                    fontsize=8,
+                )
+
+        # Hide empty subplots
+        for idx in range(len(pie_cols), n_rows * n_cols):
+            row, col_idx = divmod(idx, n_cols)
+            axes[row, col_idx].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_numeric_histograms(filtered: pd.DataFrame):
+        """Plot histograms for numeric columns."""
+        numeric_cols = [c for c in available_columns
+                       if c in filtered.columns and
+                       np.issubdtype(filtered[c].dtype, np.number) and
+                       filtered[c].nunique() > 5][:6]
+
+        # Add additional useful numeric columns if available
+        extra_numeric = ["rows", "columns", "num_slices", "pixel_spacing_row",
+                        "slice_thickness", "bits_stored", "age"]
+        for col in extra_numeric:
+            if col in filtered.columns and col not in numeric_cols:
+                if np.issubdtype(filtered[col].dtype, np.number):
+                    numeric_cols.append(col)
+        numeric_cols = numeric_cols[:6]
+
+        if not numeric_cols:
+            print("No numeric columns available for histograms.")
+            return
+
+        n_cols = min(3, len(numeric_cols))
+        n_rows = (len(numeric_cols) + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for idx, col in enumerate(numeric_cols):
+            row, col_idx = divmod(idx, n_cols)
+            ax = axes[row, col_idx]
+
+            data = filtered[col].dropna()
+            if len(data) > 0:
+                ax.hist(data, bins=30, color="#3498db", edgecolor="white", alpha=0.8)
+                ax.axvline(data.mean(), color="red", linestyle="--", label=f"Mean: {data.mean():.2f}")
+                ax.axvline(data.median(), color="green", linestyle="--", label=f"Median: {data.median():.2f}")
+                ax.set_xlabel(col.replace("_", " ").title())
+                ax.set_ylabel("Count")
+                ax.set_title(f"{col.replace('_', ' ').title()}\n(n={len(data)})", fontsize=11)
+                ax.legend(fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                ax.set_title(col.replace("_", " ").title())
+
+        # Hide empty subplots
+        for idx in range(len(numeric_cols), n_rows * n_cols):
+            row, col_idx = divmod(idx, n_cols)
+            axes[row, col_idx].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    def _update_table(filtered: pd.DataFrame):
+        """Display a sample of the filtered DataFrame."""
+        with out_table:
+            out_table.clear_output(wait=True)
+
+            # Show first few rows
+            display_cols = [c for c in filtered.columns
+                          if c not in ["dicom_files_sample", "image_orientation_patient"]][:12]
+
+            if len(filtered) > 0:
+                sample = filtered[display_cols].head(10)
+                print(f"Showing first {len(sample)} of {len(filtered)} filtered records:\n")
+                display(sample)
+            else:
+                print("No records match the current filters.")
+
+    def _update(change=None):
+        """Main update function triggered by any filter change."""
+        filtered = _apply_filters()
+        state["filtered_df"] = filtered
+
+        _update_summary(filtered)
+
+        with out_plots:
+            out_plots.clear_output(wait=True)
+
+            if len(filtered) == 0:
+                print("No data matches the current filters.")
+            else:
+                plot_type = plot_selector.value
+                if plot_type == "dist":
+                    _plot_distributions(filtered)
+                elif plot_type == "pie":
+                    _plot_pie_charts(filtered)
+                elif plot_type == "hist":
+                    _plot_numeric_histograms(filtered)
+
+        _update_table(filtered)
+
+        # Call callback if provided
+        if on_filter_callback is not None:
+            on_filter_callback(filtered)
+
+    def _reset_filters(btn):
+        """Reset all filters to default values."""
+        for col, widget in filter_widgets.items():
+            if isinstance(widget, widgets.SelectMultiple):
+                widget.value = ["(All)"]
+            elif isinstance(widget, widgets.FloatRangeSlider):
+                widget.value = [widget.min, widget.max]
+        _update()
+
+    def _export_csv(btn):
+        """Export the filtered DataFrame to CSV."""
+        from datetime import datetime
+        from pathlib import Path
+
+        filtered = state["filtered_df"]
+        if len(filtered) == 0:
+            print("No data to export.")
+            return
+
+        # Create export directory
+        export_dir = Path("logs/exported_data")
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = export_dir / f"filtered_metadata_{timestamp}.csv"
+
+        # Export (excluding complex columns)
+        export_cols = [c for c in filtered.columns if c != "dicom_files_sample"]
+        filtered[export_cols].to_csv(filename, index=False)
+
+        with out_table:
+            print(f"\n✓ Exported {len(filtered)} records to: {filename}")
+
+    # Wire up observers
+    for widget in filter_widgets.values():
+        widget.observe(_update, names="value")
+
+    plot_selector.observe(_update, names="value")
+    reset_btn.on_click(_reset_filters)
+    export_btn.on_click(_export_csv)
+
+    # Initial render
+    _update()
+
+    # Layout
+    # Arrange filter widgets in rows of 3
+    filter_rows = []
+    filter_list = list(filter_widgets.values())
+    for i in range(0, len(filter_list), 3):
+        row_widgets = filter_list[i:i+3]
+        filter_rows.append(HBox(row_widgets, layout=widgets.Layout(margin="5px 0")))
+
+    filters_box = VBox(
+        filter_rows,
+        layout=widgets.Layout(
+            border="1px solid #ddd",
+            padding="10px",
+            margin="10px 0",
+            border_radius="8px",
+        )
+    )
+
+    buttons_row = HBox([reset_btn, export_btn], layout=widgets.Layout(margin="10px 0"))
+
+    controls = VBox([
+        widgets.HTML("<h3>XNAT Metadata Filter Dashboard</h3>"),
+        widgets.HTML("<p><i>Select values in each filter to subset the data. "
+                    "Hold Ctrl/Cmd to select multiple values.</i></p>"),
+        filters_box,
+        buttons_row,
+        summary_html,
+        HBox([plot_selector, detail_col_selector]),
+    ])
+
+    # Create tabs for plots and table
+    tabs = widgets.Tab(children=[out_plots, out_table])
+    tabs.set_title(0, "Visualizations")
+    tabs.set_title(1, "Data Preview")
+
+    return VBox([controls, tabs])
