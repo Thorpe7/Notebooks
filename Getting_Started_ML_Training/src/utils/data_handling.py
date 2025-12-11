@@ -304,7 +304,7 @@ def _extract_dicom_image_metrics(scan_path: Path) -> Dict[str, Any]:
 
 
 def fetch_xnat_metadata(
-    project_id: str,
+    project_ids: Union[str, List[str]],
     connection: Optional[xnat.XNATSession] = None,
     host: Optional[str] = None,
     user: Optional[str] = None,
@@ -312,16 +312,18 @@ def fetch_xnat_metadata(
     include_dicom_metrics: bool = True,
 ) -> pd.DataFrame:
     """
-    Fetch demographic and DICOM metadata from an XNAT project using XNATpy.
+    Fetch demographic and DICOM metadata from one or more XNAT projects using XNATpy.
 
     This function connects to XNAT (using provided credentials or environment
     variables) and retrieves subject demographics and scan-level DICOM metadata
-    for all experiments in the specified project.
+    for all experiments in the specified project(s). When multiple projects are
+    provided, data from all projects is aggregated into a single DataFrame.
 
     Parameters
     ----------
-    project_id : str
-        The XNAT project ID to fetch metadata from.
+    project_ids : str or list of str
+        The XNAT project ID(s) to fetch metadata from. Can be a single project ID
+        string or a list of project IDs to aggregate data from multiple projects.
     connection : xnat.XNATSession, optional
         An existing XNATpy connection. If provided, this connection will be used
         instead of creating a new one. The connection will NOT be closed by this
@@ -341,6 +343,10 @@ def fetch_xnat_metadata(
     -------
     pd.DataFrame
         A DataFrame containing subject demographics and scan metadata with columns:
+
+        Project fields:
+        - project_id: XNAT project ID
+        - project_name: Human-readable project name/title
 
         Subject fields:
         - subject_id: XNAT subject ID
@@ -386,11 +392,15 @@ def fetch_xnat_metadata(
 
     Examples
     --------
-    Using environment variables (recommended for XNAT Jupyter):
+    Single project using environment variables:
     >>> df = fetch_xnat_metadata("00001")
 
+    Multiple projects:
+    >>> PROJECTS_LIST = ["00001", "00002", "RIDER-LUNG-CT"]
+    >>> df = fetch_xnat_metadata(PROJECTS_LIST, connection=connection)
+
     Fast retrieval without DICOM metrics:
-    >>> df = fetch_xnat_metadata("00001", include_dicom_metrics=False)
+    >>> df = fetch_xnat_metadata(["00001", "00002"], include_dicom_metrics=False)
 
     Using an existing connection:
     >>> conn = xnat.connect(host, user=user, password=password)
@@ -405,6 +415,10 @@ def fetch_xnat_metadata(
     ...     password="mypass"
     ... )
     """
+    # Normalize project_ids to a list
+    if isinstance(project_ids, str):
+        project_ids = [project_ids]
+
     # Determine whether we need to manage the connection
     close_connection = False
 
@@ -424,94 +438,100 @@ def fetch_xnat_metadata(
         close_connection = True
 
     try:
-        # Validate project exists
-        if project_id not in connection.projects:
-            available = list(connection.projects.keys())
-            raise ValueError(
-                f"Project '{project_id}' not found. Available projects: {available}"
-            )
-
-        project = connection.projects[project_id]
         records: List[Dict[str, Any]] = []
 
-        # Iterate through all subjects in the project
-        for subject in project.subjects.values():
-            subject_data = {
-                "subject_id": subject.id,
-                "subject_label": subject.label,
-                "gender": getattr(subject, "gender", None),
-                "age": getattr(subject, "age", None),
-                "handedness": getattr(subject, "handedness", None),
-            }
+        # Iterate through all requested projects
+        for project_id in project_ids:
+            # Validate project exists
+            if project_id not in connection.projects:
+                available = list(connection.projects.keys())
+                raise ValueError(
+                    f"Project '{project_id}' not found. Available projects: {available}"
+                )
 
-            # Iterate through experiments/sessions for this subject
-            for experiment in subject.experiments.values():
-                experiment_data = {
-                    **subject_data,
-                    "experiment_id": experiment.id,
-                    "experiment_label": experiment.label,
-                    "experiment_date": getattr(experiment, "date", None),
-                    "modality": getattr(experiment, "modality", None),
+            project = connection.projects[project_id]
+            project_name = getattr(project, "name", project_id)
+
+            # Iterate through all subjects in the project
+            for subject in project.subjects.values():
+                subject_data = {
+                    "project_id": project_id,
+                    "project_name": project_name,
+                    "subject_id": subject.id,
+                    "subject_label": subject.label,
+                    "gender": getattr(subject, "gender", None),
+                    "age": getattr(subject, "age", None),
+                    "handedness": getattr(subject, "handedness", None),
                 }
 
-                # Iterate through scans in this experiment
-                for scan in experiment.scans.values():
-                    scan_record = {
-                        **experiment_data,
-                        "scan_id": scan.id,
-                        "scan_type": getattr(scan, "type", None),
-                        "scan_quality": getattr(scan, "quality", None),
-                        "scan_note": getattr(scan, "note", None),
+                # Iterate through experiments/sessions for this subject
+                for experiment in subject.experiments.values():
+                    experiment_data = {
+                        **subject_data,
+                        "experiment_id": experiment.id,
+                        "experiment_label": experiment.label,
+                        "experiment_date": getattr(experiment, "date", None),
+                        "modality": getattr(experiment, "modality", None),
                     }
 
-                    # Get file paths from XNATpy resources
-                    dicom_files: List[str] = []
-                    scan_dir_path = None
+                    # Iterate through scans in this experiment
+                    for scan in experiment.scans.values():
+                        scan_record = {
+                            **experiment_data,
+                            "scan_id": scan.id,
+                            "scan_type": getattr(scan, "type", None),
+                            "scan_quality": getattr(scan, "quality", None),
+                            "scan_note": getattr(scan, "note", None),
+                        }
 
-                    # Iterate through resources (DICOM, secondary, etc.)
-                    try:
-                        for resource in scan.resources.values():
-                            resource_label = getattr(resource, "label", "")
-                            for file_obj in resource.files.values():
-                                # Get the URI which maps to the mounted path
-                                file_uri = getattr(file_obj, "uri", None)
-                                if file_uri:
-                                    # Convert URI to mounted path
-                                    # URI format: /data/experiments/.../scans/.../resources/.../files/...
-                                    # Mounted path: /data/projects/.../experiments/.../SCANS/.../DICOM/...
-                                    file_path = f"/data{file_uri}" if not file_uri.startswith("/data") else file_uri
+                        # Get file paths from XNATpy resources
+                        dicom_files: List[str] = []
+                        scan_dir_path = None
 
-                                    # Check if it's a DICOM file
-                                    if file_path.lower().endswith(".dcm"):
-                                        dicom_files.append(file_path)
+                        # Iterate through resources (DICOM, secondary, etc.)
+                        try:
+                            for resource in scan.resources.values():
+                                resource_label = getattr(resource, "label", "")
+                                for file_obj in resource.files.values():
+                                    # Get the URI which maps to the mounted path
+                                    file_uri = getattr(file_obj, "uri", None)
+                                    if file_uri:
+                                        # Convert URI to mounted path
+                                        # URI format: /data/experiments/.../scans/.../resources/.../files/...
+                                        # Mounted path: /data/projects/.../experiments/.../SCANS/.../DICOM/...
+                                        file_path = f"/data{file_uri}" if not file_uri.startswith("/data") else file_uri
 
-                                        # Extract the scan directory from the first file
-                                        if scan_dir_path is None:
-                                            scan_dir_path = str(Path(file_path).parent)
-                    except Exception:
-                        # Fall back to constructed path if resource iteration fails
-                        pass
+                                        # Check if it's a DICOM file
+                                        if file_path.lower().endswith(".dcm"):
+                                            dicom_files.append(file_path)
 
-                    # Fall back to constructed path if no files found via XNATpy
-                    if scan_dir_path is None:
-                        scan_dir_path = (
-                            f"/data/projects/{project_id}/experiments/"
-                            f"{experiment.label}/SCANS/{scan.id}"
-                        )
+                                            # Extract the scan directory from the first file
+                                            if scan_dir_path is None:
+                                                scan_dir_path = str(Path(file_path).parent)
+                        except Exception:
+                            # Fall back to constructed path if resource iteration fails
+                            pass
 
-                    scan_record["file_path"] = scan_dir_path
-                    scan_record["dicom_file_count"] = len(dicom_files) if dicom_files else None
+                        # Fall back to constructed path if no files found via XNATpy
+                        if scan_dir_path is None:
+                            scan_dir_path = (
+                                f"/data/projects/{project_id}/experiments/"
+                                f"{experiment.label}/SCANS/{scan.id}"
+                            )
 
-                    # Store first few DICOM file paths for reference
-                    if dicom_files:
-                        scan_record["dicom_files_sample"] = dicom_files[:3]
+                        scan_record["file_path"] = scan_dir_path
+                        scan_record["dicom_file_count"] = len(dicom_files) if dicom_files else None
 
-                    # Extract DICOM image metrics if requested
-                    if include_dicom_metrics:
-                        dicom_metrics = _extract_dicom_image_metrics(Path(scan_dir_path))
-                        scan_record.update(dicom_metrics)
+                        # Store first few DICOM file paths for reference
+                        if dicom_files:
+                            scan_record["dicom_files_sample"] = dicom_files[:3]
 
-                    records.append(scan_record)
+                        # Extract DICOM image metrics if requested
+                        if include_dicom_metrics:
+                            dicom_metrics = _extract_dicom_image_metrics(Path(scan_dir_path))
+                            scan_record.update(dicom_metrics)
+
+                        records.append(scan_record)
 
         # Create DataFrame
         if not records:
@@ -524,6 +544,12 @@ def fetch_xnat_metadata(
             df["experiment_date"] = pd.to_datetime(
                 df["experiment_date"], errors="coerce"
             )
+
+        # Reorder columns to put project info first
+        cols = df.columns.tolist()
+        priority_cols = ["project_id", "project_name"]
+        other_cols = [c for c in cols if c not in priority_cols]
+        df = df[priority_cols + other_cols]
 
         return df
 
