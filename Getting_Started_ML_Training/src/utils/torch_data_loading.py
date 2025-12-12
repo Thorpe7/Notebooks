@@ -1,8 +1,9 @@
 """ Pytorch utility script to load data from XNAT data hierarchy into pytorch dataset """
 import os, re, logging
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Union
 import numpy as np
+import pandas as pd
 import pydicom
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -11,6 +12,59 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
 
 _BIRADS_RE = re.compile(r'BIRADS[_-]?(\d+)', re.IGNORECASE)
+
+
+def find_dicom_paths_from_dataframe(
+    df: pd.DataFrame,
+    base_dir: str = "/data",
+) -> tuple[list[str], list[int]]:
+    """
+    Extract DICOM file paths and BIRADS labels from a metadata DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with columns: project_id, experiment_label
+        The experiment_label should contain BIRADS info (e.g., '20588458_BIRADS_2_1798085734')
+    base_dir : str
+        Base directory for XNAT data mount (default: '/data')
+
+    Returns
+    -------
+    tuple[list[str], list[int]]
+        List of DICOM file paths and corresponding BIRADS labels
+    """
+    paths, labels = [], []
+
+    for _, row in df.iterrows():
+        project_id = row.get('project_id')
+        experiment_label = row.get('experiment_label')
+
+        if pd.isna(project_id) or pd.isna(experiment_label):
+            continue
+
+        # Extract BIRADS label from experiment_label
+        m = _BIRADS_RE.search(str(experiment_label))
+        if not m:
+            continue
+        label = int(m.group(1))
+
+        # Build path to experiment directory and find DICOM files
+        exp_path = Path(base_dir) / "projects" / project_id / "experiments" / experiment_label / "SCANS"
+
+        if not exp_path.exists():
+            continue
+
+        # Find all DICOM files in secondary folders
+        for dcm in exp_path.glob("*/secondary/*.dcm"):
+            paths.append(str(dcm))
+            labels.append(label)
+
+    if not paths:
+        raise RuntimeError(f"No DICOMs found from DataFrame entries in {base_dir}")
+
+    return paths, labels
+
 
 def find_dicom_paths_with_labels(proj_id: str, base_dir: str = "/data") -> tuple[list[str], list[int]]:
     base = Path(base_dir) / "projects" / proj_id / "experiments"
@@ -72,12 +126,39 @@ def _make_class_names_from_birads(unique_birads: list[int]) -> list[str]:
     return [f"BIRADS_{l}" for l in unique_birads]
 
 def load_dicom_data_with_logging(
-    data_root: str,          # project id like "00001" (since find_* builds the full path)
+    data_source: Union[str, pd.DataFrame],  # project id, CSV path, or DataFrame
     batch_size: int = 32,
     num_workers: int = 2,
     val_split: float = 0.2,
     image_size: int = 224,   # target image size (height and width)
+    base_dir: str = "/data",  # base directory for XNAT data mount
 ) -> Dict[str, DataLoader]:
+    """
+    Load DICOM data into PyTorch DataLoaders with stratified train/val split.
+
+    Parameters
+    ----------
+    data_source : str or pd.DataFrame
+        One of:
+        - Project ID string (e.g., "InBreastProject") - scans mounted directory
+        - Path to CSV file containing filtered metadata
+        - DataFrame with columns: project_id, experiment_label
+    batch_size : int
+        Batch size for DataLoaders
+    num_workers : int
+        Number of worker processes for data loading
+    val_split : float
+        Fraction of data to use for validation
+    image_size : int
+        Target image size (height and width)
+    base_dir : str
+        Base directory for XNAT data mount (default: '/data')
+
+    Returns
+    -------
+    Dict[str, DataLoader]
+        Dictionary with 'train' and 'val' DataLoaders
+    """
     log_dir = Path.cwd() / "logs" / "data_loading"
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
@@ -86,8 +167,21 @@ def load_dicom_data_with_logging(
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
-    # 1) Discover files + BI-RADS labels (e.g., [1,4,5,6])
-    paths, targets_birads = find_dicom_paths_with_labels(data_root)
+    # 1) Discover files + BI-RADS labels based on data_source type
+    if isinstance(data_source, pd.DataFrame):
+        # Use DataFrame directly
+        logging.info(f"Loading DICOM paths from DataFrame with {len(data_source)} rows")
+        paths, targets_birads = find_dicom_paths_from_dataframe(data_source, base_dir=base_dir)
+    elif isinstance(data_source, str) and data_source.endswith('.csv'):
+        # Load from CSV file
+        logging.info(f"Loading DICOM paths from CSV: {data_source}")
+        df = pd.read_csv(data_source)
+        paths, targets_birads = find_dicom_paths_from_dataframe(df, base_dir=base_dir)
+    else:
+        # Assume it's a project ID (original behavior)
+        logging.info(f"Loading DICOM paths from project: {data_source}")
+        paths, targets_birads = find_dicom_paths_with_labels(data_source, base_dir=base_dir)
+
     indices = np.arange(len(paths))
 
     # 2) Build mapping BI-RADS -> contiguous ids (0..K-1)
