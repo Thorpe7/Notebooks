@@ -157,14 +157,35 @@ def data_filter_dashboard(
     # -------------------------------------------------------------------------
     def _get_all_filterable_columns(dataframe: pd.DataFrame) -> List[str]:
         """Get all columns that could potentially be used for filtering."""
+        # Columns to always exclude from filtering
+        excluded_columns = [
+            "dicom_files_sample", "file_path", "image_orientation_patient",
+            "project_id",  # Exclude project_id - use project_name instead
+        ]
+
+        # Columns to always include if they exist (even if all null in some datasets)
+        always_include = [
+            "slice_thickness", "pixel_spacing_row", "pixel_spacing_col",
+            "voxel_volume_mm3", "pixel_area_mm2", "num_slices",
+            "rows", "columns", "bits_stored", "modality", "manufacturer",
+            "body_part_examined", "gender", "project_name",
+        ]
+
         candidates = []
         for col in dataframe.columns:
-            # Skip certain columns that aren't useful for filtering
-            if col in ["dicom_files_sample", "file_path", "image_orientation_patient"]:
+            # Skip excluded columns
+            if col in excluded_columns:
                 continue
-            # Skip columns with all null values
+
+            # Always include priority columns if they exist
+            if col in always_include:
+                candidates.append(col)
+                continue
+
+            # Skip columns with all null values for non-priority columns
             if dataframe[col].isna().all():
                 continue
+
             # For object/string columns, check cardinality
             if dataframe[col].dtype == "object" or str(dataframe[col].dtype) == "category":
                 n_unique = dataframe[col].nunique()
@@ -221,8 +242,14 @@ def data_filter_dashboard(
     def _create_filter_widget(col: str) -> Optional[widgets.Widget]:
         """Create appropriate filter widget based on column type."""
         col_data = df[col].dropna()
+
+        # Handle columns with no non-null values - show placeholder
         if col_data.empty:
-            return None
+            widget = widgets.HTML(
+                value="<div style='padding: 10px; color: #666; font-style: italic;'>"
+                      "No data available for this filter</div>"
+            )
+            return widget
 
         # For categorical/object columns, use SelectMultiple
         if df[col].dtype == "object" or str(df[col].dtype) == "category":
@@ -238,7 +265,14 @@ def data_filter_dashboard(
         # For numeric columns with few unique values, use SelectMultiple
         elif np.issubdtype(df[col].dtype, np.number):
             n_unique = col_data.nunique()
-            if n_unique <= 20:
+            if n_unique == 0:
+                # No valid numeric values
+                widget = widgets.HTML(
+                    value="<div style='padding: 10px; color: #666; font-style: italic;'>"
+                          "No data available for this filter</div>"
+                )
+                return widget
+            elif n_unique <= 20:
                 unique_vals = sorted(col_data.unique())
                 unique_vals_str = [str(v) for v in unique_vals]
                 widget = widgets.SelectMultiple(
@@ -275,7 +309,10 @@ def data_filter_dashboard(
             widget = _create_filter_widget(col)
             if widget is not None:
                 filter_widgets[col] = widget
-                widget.observe(_update, names="value")
+
+                # Only attach observers to interactive widgets (not HTML placeholders)
+                if hasattr(widget, "observe"):
+                    widget.observe(_update, names="value")
 
                 # Create a labeled box for this filter
                 label = widgets.HTML(
