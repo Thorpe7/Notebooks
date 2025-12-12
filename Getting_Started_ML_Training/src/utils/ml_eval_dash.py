@@ -3,7 +3,7 @@ ML Evaluation Dashboard for comparing training runs.
 
 This module provides an interactive dashboard for evaluating and comparing
 ML training runs with visualizations including loss curves, confusion matrices,
-ROC curves, and Grad-CAM comparisons.
+ROC curves, confidence distributions, and Grad-CAM comparisons.
 """
 
 from typing import List
@@ -162,6 +162,100 @@ def ml_evaluation_dashboard(
         else:
             return plt.cm.jet(cam_resized)[:, :, :3]
 
+    def _get_model_and_layer(run):
+        """Try to load model from run and get target layer for Grad-CAM."""
+        if run.model_state_dict is None:
+            return None, None
+
+        model_name = run.metadata.model_name.lower()
+
+        try:
+            # Try to create the model based on model_name
+            if "efficientnet" in model_name:
+                from ..models.efficientnet import create_efficientnet_b0
+                num_classes = len(run.metadata.class_names)
+                model = create_efficientnet_b0(num_classes=num_classes)
+                model.load_state_dict(run.model_state_dict)
+                model.to(device)
+                model.eval()
+                # Get target layer for EfficientNet
+                target_layer = model.model.features[-1]
+                return model, target_layer
+            elif "resnet" in model_name:
+                from torchvision import models
+                num_classes = len(run.metadata.class_names)
+                model = models.resnet50(weights=None)
+                model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+                model.load_state_dict(run.model_state_dict)
+                model.to(device)
+                model.eval()
+                target_layer = model.layer4[-1]
+                return model, target_layer
+        except Exception as e:
+            print(f"Could not load model: {e}")
+            return None, None
+
+        return None, None
+
+    def _compute_gradcam(model, target_layer, img_tensor, target_class=None):
+        """Compute Grad-CAM for a single image."""
+        if model is None or target_layer is None:
+            return None
+
+        # Storage for activations and gradients
+        activations = []
+        gradients = []
+
+        def forward_hook(module, input, output):
+            activations.append(output.detach())
+
+        def backward_hook(module, grad_input, grad_output):
+            gradients.append(grad_output[0].detach())
+
+        # Register hooks
+        forward_handle = target_layer.register_forward_hook(forward_hook)
+        backward_handle = target_layer.register_full_backward_hook(backward_hook)
+
+        try:
+            # Forward pass
+            model.zero_grad()
+            img_batch = img_tensor.unsqueeze(0).to(device)
+            output = model(img_batch)
+
+            # Get target class (predicted class if not specified)
+            if target_class is None:
+                target_class = output.argmax(dim=1).item()
+
+            # Backward pass
+            one_hot = torch.zeros_like(output)
+            one_hot[0, target_class] = 1
+            output.backward(gradient=one_hot)
+
+            # Compute Grad-CAM
+            if activations and gradients:
+                activation = activations[0]
+                gradient = gradients[0]
+
+                # Global average pooling of gradients
+                weights = gradient.mean(dim=(2, 3), keepdim=True)
+
+                # Weighted combination of activation maps
+                cam = (weights * activation).sum(dim=1, keepdim=True)
+                cam = F.relu(cam)
+
+                # Normalize
+                cam = cam.squeeze().cpu().numpy()
+                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+                return cam
+        except Exception as e:
+            print(f"Grad-CAM computation error: {e}")
+        finally:
+            forward_handle.remove()
+            backward_handle.remove()
+
+        return None
+
     def _get_dataset_info(run):
         """Extract dataset CSV info from run metadata."""
         hp = run.metadata.hyperparameters or {}
@@ -254,6 +348,7 @@ def ml_evaluation_dashboard(
             ("Loss Curves", "loss"),
             ("Confusion Matrix", "cm"),
             ("ROC Curves", "roc"),
+            ("Confidence", "confidence"),
             ("Grad-CAM", "gradcam"),
             ("Comparison", "compare"),
         ],
@@ -348,6 +443,7 @@ def ml_evaluation_dashboard(
             f1_class = "metric-good" if s["f1_macro"] == best_f1 else ""
             dataset_csv = _get_dataset_info(run)
             created = s["created_at"][:10] if s["created_at"] else "N/A"
+            best_val_loss_str = f"{s['best_val_loss']:.4f}" if s['best_val_loss'] else "N/A"
 
             html += f"""
                 <tr>
@@ -356,7 +452,7 @@ def ml_evaluation_dashboard(
                     <td>{s['num_epochs']}</td>
                     <td class="{acc_class}">{s['accuracy']:.4f}</td>
                     <td class="{f1_class}">{s['f1_macro']:.4f}</td>
-                    <td>{s['best_val_loss']:.4f if s['best_val_loss'] else 'N/A'}</td>
+                    <td>{best_val_loss_str}</td>
                     <td><code>{dataset_csv}</code></td>
                     <td>{created}</td>
                 </tr>
@@ -541,6 +637,158 @@ def ml_evaluation_dashboard(
         plt.tight_layout()
         plt.show()
 
+    def _show_confidence_distribution():
+        """Show confidence distribution for selected runs."""
+        selected = list(run_selector.value)
+        if not selected:
+            print("No runs selected.")
+            return
+
+        runs = [_load_run(rid) for rid in selected]
+        n_runs = len(runs)
+
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        colors = plt.cm.tab10(np.linspace(0, 1, n_runs))
+
+        # Plot 1: Overall confidence distribution
+        for run, color in zip(runs, colors):
+            # Get max confidence (predicted class probability) for each sample
+            max_conf = run.probs.max(axis=1)
+            axes[0, 0].hist(max_conf, bins=20, alpha=0.5, color=color,
+                           label=run.metadata.run_name[:20], density=True, edgecolor='black', linewidth=0.5)
+
+        axes[0, 0].set_xlabel("Prediction Confidence")
+        axes[0, 0].set_ylabel("Density")
+        axes[0, 0].set_title("Overall Confidence Distribution", fontweight="bold")
+        axes[0, 0].legend(fontsize=8)
+        axes[0, 0].set_xlim(0, 1)
+        axes[0, 0].axvline(x=0.5, color="gray", linestyle="--", alpha=0.5, label="Random guess")
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # Plot 2: Confidence for correct vs incorrect predictions
+        for run, color in zip(runs, colors):
+            max_conf = run.probs.max(axis=1)
+            correct_mask = run.preds == run.labels
+
+            correct_conf = max_conf[correct_mask]
+            incorrect_conf = max_conf[~correct_mask]
+
+            if len(correct_conf) > 0:
+                axes[0, 1].hist(correct_conf, bins=15, alpha=0.4, color=color,
+                               label=f"{run.metadata.run_name[:15]} (correct)", density=True,
+                               edgecolor='black', linewidth=0.5)
+            if len(incorrect_conf) > 0:
+                axes[0, 1].hist(incorrect_conf, bins=15, alpha=0.4, color=color,
+                               hatch='//', label=f"{run.metadata.run_name[:15]} (incorrect)", density=True,
+                               edgecolor='black', linewidth=0.5)
+
+        axes[0, 1].set_xlabel("Prediction Confidence")
+        axes[0, 1].set_ylabel("Density")
+        axes[0, 1].set_title("Confidence: Correct vs Incorrect", fontweight="bold")
+        axes[0, 1].legend(fontsize=7, loc="upper left")
+        axes[0, 1].set_xlim(0, 1)
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # Plot 3: Mean confidence per class (bar chart)
+        if n_runs > 0:
+            run = runs[0]  # Use first run for class names
+            class_names = run.metadata.class_names
+            n_classes = len(class_names)
+            x = np.arange(n_classes)
+            width = 0.8 / n_runs
+
+            for i, run in enumerate(runs):
+                mean_conf_per_class = []
+                for c in range(n_classes):
+                    mask = run.labels == c
+                    if mask.sum() > 0:
+                        # Mean confidence for the TRUE class
+                        mean_conf_per_class.append(run.probs[mask, c].mean())
+                    else:
+                        mean_conf_per_class.append(0)
+
+                offset = (i - n_runs/2 + 0.5) * width
+                axes[1, 0].bar(x + offset, mean_conf_per_class, width,
+                              label=run.metadata.run_name[:20], alpha=0.8)
+
+            axes[1, 0].set_xticks(x)
+            axes[1, 0].set_xticklabels(class_names, rotation=45, ha="right")
+            axes[1, 0].set_ylabel("Mean Confidence")
+            axes[1, 0].set_title("Mean Confidence for True Class", fontweight="bold")
+            axes[1, 0].legend(fontsize=8)
+            axes[1, 0].set_ylim(0, 1.1)
+            axes[1, 0].axhline(y=1/n_classes, color="gray", linestyle="--", alpha=0.5)
+            axes[1, 0].grid(True, alpha=0.3, axis='y')
+
+        # Plot 4: Confidence calibration (reliability diagram)
+        for run, color in zip(runs, colors):
+            max_conf = run.probs.max(axis=1)
+            correct_mask = run.preds == run.labels
+
+            # Bin predictions by confidence
+            n_bins = 10
+            bin_edges = np.linspace(0, 1, n_bins + 1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+            bin_accuracies = []
+            bin_counts = []
+
+            for j in range(n_bins):
+                mask = (max_conf >= bin_edges[j]) & (max_conf < bin_edges[j + 1])
+                if mask.sum() > 0:
+                    bin_accuracies.append(correct_mask[mask].mean())
+                    bin_counts.append(mask.sum())
+                else:
+                    bin_accuracies.append(np.nan)
+                    bin_counts.append(0)
+
+            # Plot reliability diagram
+            valid_mask = ~np.isnan(bin_accuracies)
+            axes[1, 1].plot(np.array(bin_centers)[valid_mask], np.array(bin_accuracies)[valid_mask],
+                           'o-', color=color, label=run.metadata.run_name[:20], linewidth=2, markersize=6)
+
+        # Perfect calibration line
+        axes[1, 1].plot([0, 1], [0, 1], 'k--', alpha=0.5, label="Perfect calibration")
+        axes[1, 1].set_xlabel("Mean Predicted Confidence")
+        axes[1, 1].set_ylabel("Fraction of Correct Predictions")
+        axes[1, 1].set_title("Calibration Diagram (Reliability)", fontweight="bold")
+        axes[1, 1].legend(fontsize=8)
+        axes[1, 1].set_xlim(0, 1)
+        axes[1, 1].set_ylim(0, 1)
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].set_aspect('equal')
+
+        plt.tight_layout()
+        plt.show()
+
+        # Print calibration statistics
+        print("\nCalibration Statistics:")
+        print("-" * 60)
+        for run in runs:
+            max_conf = run.probs.max(axis=1)
+            correct_mask = run.preds == run.labels
+
+            # Expected Calibration Error (ECE)
+            n_bins = 10
+            bin_edges = np.linspace(0, 1, n_bins + 1)
+            ece = 0
+            total_samples = len(max_conf)
+
+            for j in range(n_bins):
+                mask = (max_conf >= bin_edges[j]) & (max_conf < bin_edges[j + 1])
+                if mask.sum() > 0:
+                    bin_acc = correct_mask[mask].mean()
+                    bin_conf = max_conf[mask].mean()
+                    ece += (mask.sum() / total_samples) * abs(bin_acc - bin_conf)
+
+            avg_conf = max_conf.mean()
+            accuracy = correct_mask.mean()
+
+            print(f"{run.metadata.run_name[:30]}")
+            print(f"  Avg Confidence: {avg_conf:.3f} | Accuracy: {accuracy:.3f} | ECE: {ece:.4f}")
+
     def _show_gradcam():
         """Show Grad-CAM comparison."""
         selected = list(run_selector.value)
@@ -565,7 +813,7 @@ def ml_evaluation_dashboard(
             _show_gradcam_averages(runs_with_images)
 
     def _show_gradcam_individual(runs):
-        """Show individual sample comparison."""
+        """Show individual sample comparison with Grad-CAM heatmaps."""
         # Use first run to determine sample count
         n_samples = min(len(r.images) for r in runs)
         sample_slider.max = n_samples - 1
@@ -594,23 +842,22 @@ def ml_evaluation_dashboard(
         sample_idx = valid_indices[idx] if idx < len(valid_indices) else valid_indices[0]
 
         n_runs = len(runs)
+        # Create 2 rows: original images and Grad-CAM overlays
         n_cols = min(3, n_runs)
-        n_rows = (n_runs + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
-        if n_runs == 1:
-            axes = np.array([[axes]])
-        elif n_rows == 1:
-            axes = axes.reshape(1, -1)
-        elif n_cols == 1:
-            axes = axes.reshape(-1, 1)
+        fig, axes = plt.subplots(2, n_cols, figsize=(5 * n_cols, 10))
+        if n_cols == 1:
+            axes = axes.reshape(2, 1)
 
         true_label = runs[0].labels[sample_idx]
         class_names = runs[0].metadata.class_names
 
+        # Track if any model could compute Grad-CAM
+        any_gradcam = False
+
         for run_idx, run in enumerate(runs):
-            row, col = divmod(run_idx, n_cols)
-            ax = axes[row, col]
+            if run_idx >= n_cols:
+                break  # Only show up to n_cols runs
 
             img = run.images[sample_idx]
             pred = run.preds[sample_idx]
@@ -620,25 +867,67 @@ def ml_evaluation_dashboard(
             img_display = img.transpose(1, 2, 0)
             img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8)
 
-            ax.imshow(img_display)
+            # Row 0: Original image
+            axes[0, run_idx].imshow(img_display)
 
             is_correct = pred == true_label
             status = "CORRECT" if is_correct else "INCORRECT"
-            color = "green" if is_correct else "red"
+            title_color = "green" if is_correct else "red"
 
-            ax.set_title(
+            axes[0, run_idx].set_title(
                 f"{run.metadata.run_name[:20]}\n"
                 f"Pred: {class_names[pred]} ({conf:.1%})\n"
                 f"[{status}]",
                 fontsize=10,
-                color=color,
+                color=title_color,
             )
-            ax.axis("off")
+            axes[0, run_idx].axis("off")
 
-        # Hide empty
-        for run_idx in range(n_runs, n_rows * n_cols):
-            row, col = divmod(run_idx, n_cols)
-            axes[row, col].axis("off")
+            # Row 1: Grad-CAM overlay
+            # Try to compute Grad-CAM if model is available
+            model, target_layer = _get_model_and_layer(run)
+
+            if model is not None and target_layer is not None:
+                # Compute Grad-CAM
+                img_tensor = torch.from_numpy(img).float()
+                cam = _compute_gradcam(model, target_layer, img_tensor, target_class=pred)
+
+                if cam is not None:
+                    any_gradcam = True
+                    # Resize CAM to image size
+                    h, w = img_display.shape[:2]
+                    cam_resized = _resize_cam(cam, h, w)
+
+                    # Create heatmap overlay
+                    heatmap = _cam_to_heatmap(cam_resized)
+
+                    # Blend with original image
+                    overlay = 0.5 * img_display + 0.5 * heatmap
+                    overlay = np.clip(overlay, 0, 1)
+
+                    axes[1, run_idx].imshow(overlay)
+                    axes[1, run_idx].set_title("Grad-CAM Attention", fontsize=10)
+                else:
+                    axes[1, run_idx].imshow(img_display)
+                    axes[1, run_idx].set_title("Grad-CAM failed", fontsize=10, color="orange")
+            else:
+                # No model available - show message
+                axes[1, run_idx].imshow(img_display, alpha=0.5)
+                axes[1, run_idx].text(
+                    0.5, 0.5, "Model not saved\nwith this run",
+                    ha="center", va="center",
+                    transform=axes[1, run_idx].transAxes,
+                    fontsize=12, color="red",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8)
+                )
+                axes[1, run_idx].set_title("No Grad-CAM available", fontsize=10, color="orange")
+
+            axes[1, run_idx].axis("off")
+
+        # Hide empty columns
+        for run_idx in range(n_runs, n_cols):
+            axes[0, run_idx].axis("off")
+            axes[1, run_idx].axis("off")
 
         fig.suptitle(
             f"Sample {sample_idx + 1}/{n_samples} | True: {class_names[true_label]}",
@@ -647,6 +936,9 @@ def ml_evaluation_dashboard(
         )
         plt.tight_layout()
         plt.show()
+
+        if not any_gradcam:
+            print("\nNote: To enable Grad-CAM visualization, save training runs with save_model=True")
 
         # Show probability comparison
         fig2, ax2 = plt.subplots(figsize=(10, 4))
@@ -854,6 +1146,8 @@ def ml_evaluation_dashboard(
                 _show_confusion_matrices()
             elif view == "roc":
                 _show_roc_curves()
+            elif view == "confidence":
+                _show_confidence_distribution()
             elif view == "gradcam":
                 _show_gradcam()
             elif view == "compare":
