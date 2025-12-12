@@ -164,11 +164,36 @@ def data_filter_dashboard(
         ]
 
         # Columns to always include if they exist (even if all null in some datasets)
+        # This list prioritizes commonly useful imaging columns, but the dashboard
+        # will dynamically include any column that exists in the DataFrame
         always_include = [
+            # Core identifiers
+            "project_name", "modality", "body_part_examined",
+            # Core imaging metrics
             "slice_thickness", "pixel_spacing_row", "pixel_spacing_col",
-            "voxel_volume_mm3", "pixel_area_mm2", "num_slices",
-            "rows", "columns", "bits_stored", "modality", "manufacturer",
-            "body_part_examined", "gender", "project_name",
+            "voxel_volume_mm3", "pixel_area_mm2", "num_slices", "number_of_frames",
+            "rows", "columns", "bits_stored", "bits_allocated",
+            # Scanner info
+            "manufacturer", "manufacturer_model_name",
+            # Demographics
+            "gender", "patient_sex",
+            # MRI specific
+            "magnetic_field_strength", "repetition_time", "echo_time",
+            "flip_angle", "mr_acquisition_type", "scanning_sequence",
+            "inversion_time", "echo_train_length",
+            # CT specific
+            "kvp", "convolution_kernel", "reconstruction_diameter",
+            "gantry_detector_tilt", "exposure", "x_ray_tube_current",
+            # PET specific
+            "radiopharmaceutical", "decay_correction",
+            "attenuation_correction_method", "reconstruction_method",
+            # General series/study
+            "series_description", "study_description", "protocol_name",
+            "image_type", "contrast_bolus_agent",
+            # Window settings
+            "window_center", "window_width",
+            # Temporal
+            "temporal_position_identifier", "number_of_temporal_positions",
         ]
 
         candidates = []

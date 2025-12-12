@@ -148,62 +148,182 @@ def collect_dicom_metadata(
     return df
 
 
-def _extract_dicom_image_metrics(scan_path: Path) -> Dict[str, Any]:
+def _convert_dicom_name_to_snake_case(name: str) -> str:
+    """Convert DICOM attribute name (CamelCase) to snake_case for DataFrame columns."""
+    import re
+    # Insert underscore before uppercase letters and convert to lowercase
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
+def _extract_dicom_value(element) -> Any:
+    """
+    Safely extract a value from a DICOM element for DataFrame storage.
+
+    Handles sequences, multi-valued elements, and special types.
+    """
+    if element is None:
+        return None
+
+    try:
+        value = element.value
+
+        # Skip empty values
+        if value is None or value == "":
+            return None
+
+        # Handle sequences - extract key info or skip
+        if element.VR == "SQ":
+            # For sequences, try to extract first item's key values
+            if len(value) > 0:
+                # Return count of items in sequence
+                return f"[Sequence: {len(value)} items]"
+            return None
+
+        # Handle byte arrays (pixel data, etc.)
+        if isinstance(value, bytes):
+            return f"[Binary: {len(value)} bytes]"
+
+        # Handle multi-valued elements
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+            value_list = list(value)
+            if len(value_list) == 0:
+                return None
+            elif len(value_list) == 1:
+                return _safe_convert_value(value_list[0])
+            else:
+                # Join multi-valued items with backslash (DICOM convention)
+                return "\\".join(str(_safe_convert_value(v)) for v in value_list)
+
+        return _safe_convert_value(value)
+    except Exception:
+        return None
+
+
+def _safe_convert_value(value) -> Any:
+    """Convert DICOM value to a Python-native type safe for DataFrames."""
+    if value is None:
+        return None
+
+    # Handle pydicom special types
+    type_name = type(value).__name__
+
+    if type_name in ('DSfloat', 'DSdecimal', 'IS'):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return str(value)
+    elif type_name == 'PersonName':
+        return str(value)
+    elif type_name == 'DA':  # Date
+        return str(value)
+    elif type_name == 'TM':  # Time
+        return str(value)
+    elif type_name == 'DT':  # DateTime
+        return str(value)
+    elif type_name == 'UID':
+        return str(value)
+    elif isinstance(value, (int, float, str, bool)):
+        return value
+    else:
+        try:
+            return str(value)
+        except Exception:
+            return None
+
+
+def _discover_dicom_tags(ds: pydicom.Dataset) -> Dict[str, str]:
+    """
+    Discover all DICOM tags from a dataset.
+
+    Returns a dict mapping snake_case column names to DICOM attribute names.
+    """
+    # Tags to exclude (pixel data, large binary data, internal tags)
+    exclude_keywords = {
+        'PixelData', 'pixel_data',
+        'OverlayData', 'overlay_data',
+        'EncapsulatedDocument', 'encapsulated_document',
+        'SpectroscopyData', 'spectroscopy_data',
+        'AudioSampleData', 'audio_sample_data',
+        'CurveData', 'curve_data',
+        'ChannelSensitivityCorrectionFactor',
+        'WaveformData', 'waveform_data',
+        'FloatPixelData', 'float_pixel_data',
+        'DoubleFloatPixelData', 'double_float_pixel_data',
+        'RedPaletteColorLookupTableData',
+        'GreenPaletteColorLookupTableData',
+        'BluePaletteColorLookupTableData',
+    }
+
+    tags = {}
+
+    for elem in ds:
+        # Skip group length elements
+        if elem.tag.element == 0:
+            continue
+
+        # Get keyword (attribute name)
+        keyword = elem.keyword
+        if not keyword or keyword in exclude_keywords:
+            continue
+
+        # Skip private tags (odd group numbers)
+        if elem.tag.group % 2 == 1:
+            continue
+
+        # Convert to snake_case for column name
+        col_name = _convert_dicom_name_to_snake_case(keyword)
+
+        # Skip if already have this column
+        if col_name in tags:
+            continue
+
+        tags[col_name] = keyword
+
+    # Also check file_meta if available
+    if hasattr(ds, 'file_meta'):
+        for elem in ds.file_meta:
+            if elem.tag.element == 0:
+                continue
+            keyword = elem.keyword
+            if not keyword or keyword in exclude_keywords:
+                continue
+            col_name = _convert_dicom_name_to_snake_case(keyword)
+            if col_name not in tags:
+                tags[col_name] = keyword
+
+    return tags
+
+
+def _extract_dicom_image_metrics(
+    scan_path: Path,
+    known_tags: Dict[str, str],
+    seen_modalities: set,
+) -> tuple[Dict[str, Any], Dict[str, str]]:
     """
     Extract image metrics from the first DICOM file found in a scan directory.
+
+    Dynamically discovers DICOM tags based on modality/scan type. For new
+    modalities, all available tags are discovered and added to known_tags.
 
     Parameters
     ----------
     scan_path : Path
         Path to the scan directory (e.g., /data/projects/.../SCANS/1)
+    known_tags : Dict[str, str]
+        Dictionary mapping column names to DICOM keywords. Updated in place
+        when new modalities are discovered.
+    seen_modalities : set
+        Set of modalities/scan types already processed. Updated in place.
 
     Returns
     -------
-    dict
-        Dictionary containing image metrics extracted from DICOM headers.
+    tuple[Dict[str, Any], Dict[str, str]]
+        Tuple of (metrics dict, updated known_tags dict)
     """
-    metrics: Dict[str, Any] = {
-        # Image dimensions
-        "rows": None,
-        "columns": None,
-        "num_slices": None,
-        # Pixel spacing and resolution
-        "pixel_spacing_row": None,
-        "pixel_spacing_col": None,
-        "slice_thickness": None,
-        "spacing_between_slices": None,
-        # Image characteristics
-        "bits_allocated": None,
-        "bits_stored": None,
-        "high_bit": None,
-        "pixel_representation": None,
-        "photometric_interpretation": None,
-        "samples_per_pixel": None,
-        # Acquisition parameters
-        "kvp": None,
-        "exposure": None,
-        "exposure_time": None,
-        "tube_current": None,
-        "convolution_kernel": None,
-        "reconstruction_diameter": None,
-        # Window settings
-        "window_center": None,
-        "window_width": None,
-        # Scanner info
-        "manufacturer": None,
-        "manufacturer_model_name": None,
-        "station_name": None,
-        "software_versions": None,
-        # Series info
-        "series_description": None,
-        "series_number": None,
-        "acquisition_number": None,
-        "instance_number": None,
-        # Patient position
-        "patient_position": None,
-        "image_orientation_patient": None,
-        "body_part_examined": None,
-    }
+    # Initialize metrics with None for all known tags
+    metrics: Dict[str, Any] = {col: None for col in known_tags}
+    metrics["num_slices"] = None
 
     # Find DICOM files in the scan directory
     dcm_files = []
@@ -215,7 +335,7 @@ def _extract_dicom_image_metrics(scan_path: Path) -> Dict[str, Any]:
                 break
 
     if not dcm_files:
-        return metrics
+        return metrics, known_tags
 
     # Count total slices
     metrics["num_slices"] = len(dcm_files)
@@ -224,83 +344,58 @@ def _extract_dicom_image_metrics(scan_path: Path) -> Dict[str, Any]:
     try:
         ds = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
     except Exception:
-        return metrics
+        return metrics, known_tags
 
-    # Helper to safely extract values
-    def safe_get(attr: str, default=None):
-        val = getattr(ds, attr, default)
-        if val is None:
-            return default
-        try:
-            # Handle multi-valued attributes
-            if hasattr(val, "__iter__") and not isinstance(val, str):
-                return list(val) if len(val) > 1 else val[0]
-            return val
-        except Exception:
-            return default
+    # Determine modality/scan type for tag discovery
+    modality = getattr(ds, 'Modality', 'UNKNOWN')
+    sop_class = getattr(ds, 'SOPClassUID', '')
+    scan_type_key = f"{modality}_{sop_class}"
 
-    # Image dimensions
-    metrics["rows"] = safe_get("Rows")
-    metrics["columns"] = safe_get("Columns")
+    # If this is a new modality/scan type, discover all available tags
+    if scan_type_key not in seen_modalities:
+        seen_modalities.add(scan_type_key)
+        new_tags = _discover_dicom_tags(ds)
 
-    # Pixel spacing
-    pixel_spacing = safe_get("PixelSpacing")
-    if pixel_spacing is not None:
-        if hasattr(pixel_spacing, "__iter__") and not isinstance(pixel_spacing, str):
-            pixel_spacing = list(pixel_spacing)
-            if len(pixel_spacing) >= 2:
-                metrics["pixel_spacing_row"] = float(pixel_spacing[0])
-                metrics["pixel_spacing_col"] = float(pixel_spacing[1])
-        else:
-            metrics["pixel_spacing_row"] = float(pixel_spacing)
-            metrics["pixel_spacing_col"] = float(pixel_spacing)
+        # Add new tags to known_tags
+        for col_name, keyword in new_tags.items():
+            if col_name not in known_tags:
+                known_tags[col_name] = keyword
+                metrics[col_name] = None  # Initialize in current metrics
 
-    metrics["slice_thickness"] = safe_get("SliceThickness")
-    metrics["spacing_between_slices"] = safe_get("SpacingBetweenSlices")
+    # Extract values for all known tags
+    for col_name, keyword in known_tags.items():
+        if col_name == "num_slices":
+            continue  # Already set
 
-    # Image characteristics
-    metrics["bits_allocated"] = safe_get("BitsAllocated")
-    metrics["bits_stored"] = safe_get("BitsStored")
-    metrics["high_bit"] = safe_get("HighBit")
-    metrics["pixel_representation"] = safe_get("PixelRepresentation")
-    metrics["photometric_interpretation"] = safe_get("PhotometricInterpretation")
-    metrics["samples_per_pixel"] = safe_get("SamplesPerPixel")
+        # Try to get from main dataset
+        if hasattr(ds, keyword):
+            elem = ds.data_element(keyword)
+            if elem is not None:
+                metrics[col_name] = _extract_dicom_value(elem)
 
-    # Acquisition parameters (CT/X-ray specific)
-    metrics["kvp"] = safe_get("KVP")
-    metrics["exposure"] = safe_get("Exposure")
-    metrics["exposure_time"] = safe_get("ExposureTime")
-    metrics["tube_current"] = safe_get("XRayTubeCurrent")
-    metrics["convolution_kernel"] = safe_get("ConvolutionKernel")
-    metrics["reconstruction_diameter"] = safe_get("ReconstructionDiameter")
+        # Try file_meta for certain tags
+        elif hasattr(ds, 'file_meta') and hasattr(ds.file_meta, keyword):
+            elem = ds.file_meta.data_element(keyword)
+            if elem is not None:
+                metrics[col_name] = _extract_dicom_value(elem)
 
-    # Window settings
-    metrics["window_center"] = safe_get("WindowCenter")
-    metrics["window_width"] = safe_get("WindowWidth")
+    # Handle special cases for pixel spacing (split into row/col)
+    if "pixel_spacing" in metrics and metrics["pixel_spacing"]:
+        ps = metrics["pixel_spacing"]
+        if isinstance(ps, str) and "\\" in ps:
+            parts = ps.split("\\")
+            if len(parts) >= 2:
+                try:
+                    metrics["pixel_spacing_row"] = float(parts[0])
+                    metrics["pixel_spacing_col"] = float(parts[1])
+                except ValueError:
+                    pass
+        # Add these to known_tags if not present
+        if "pixel_spacing_row" not in known_tags:
+            known_tags["pixel_spacing_row"] = "_derived_pixel_spacing_row"
+            known_tags["pixel_spacing_col"] = "_derived_pixel_spacing_col"
 
-    # Scanner info
-    metrics["manufacturer"] = safe_get("Manufacturer")
-    metrics["manufacturer_model_name"] = safe_get("ManufacturerModelName")
-    metrics["station_name"] = safe_get("StationName")
-    metrics["software_versions"] = safe_get("SoftwareVersions")
-
-    # Series info
-    metrics["series_description"] = safe_get("SeriesDescription")
-    metrics["series_number"] = safe_get("SeriesNumber")
-    metrics["acquisition_number"] = safe_get("AcquisitionNumber")
-    metrics["instance_number"] = safe_get("InstanceNumber")
-
-    # Patient position
-    metrics["patient_position"] = safe_get("PatientPosition")
-    iop = safe_get("ImageOrientationPatient")
-    if iop is not None:
-        if hasattr(iop, "__iter__") and not isinstance(iop, str):
-            metrics["image_orientation_patient"] = ",".join(str(x) for x in iop)
-        else:
-            metrics["image_orientation_patient"] = str(iop)
-    metrics["body_part_examined"] = safe_get("BodyPartExamined")
-
-    return metrics
+    return metrics, known_tags
 
 
 def fetch_xnat_metadata(
@@ -490,6 +585,12 @@ def fetch_xnat_metadata(
     try:
         records: List[Dict[str, Any]] = []
 
+        # Dynamic tag discovery: track known tags and seen modalities
+        known_tags: Dict[str, str] = {
+            "num_slices": "_derived_num_slices",
+        }
+        seen_modalities: set = set()
+
         # Iterate through all requested projects
         for project_id in project_ids:
             # Validate project exists
@@ -578,7 +679,11 @@ def fetch_xnat_metadata(
 
                         # Extract DICOM image metrics if requested
                         if include_dicom_metrics:
-                            dicom_metrics = _extract_dicom_image_metrics(Path(scan_dir_path))
+                            dicom_metrics, known_tags = _extract_dicom_image_metrics(
+                                Path(scan_dir_path),
+                                known_tags,
+                                seen_modalities,
+                            )
                             scan_record.update(dicom_metrics)
 
                         records.append(scan_record)
@@ -586,6 +691,18 @@ def fetch_xnat_metadata(
         # Create DataFrame
         if not records:
             return pd.DataFrame()
+
+        # Normalize records: ensure all records have all discovered columns
+        # (earlier records may be missing columns discovered later)
+        if include_dicom_metrics:
+            all_columns = set()
+            for record in records:
+                all_columns.update(record.keys())
+
+            for record in records:
+                for col in all_columns:
+                    if col not in record:
+                        record[col] = None
 
         df = pd.DataFrame.from_records(records)
 
