@@ -178,8 +178,8 @@ def ml_evaluation_dashboard(
                 model.load_state_dict(run.model_state_dict)
                 model.to(device)
                 model.eval()
-                # Get target layer for EfficientNet
-                target_layer = model.model.features[-1]
+                # Get target layer for EfficientNet (backbone.features[-1])
+                target_layer = model.backbone.features[-1]
                 return model, target_layer
             elif "resnet" in model_name:
                 from torchvision import models
