@@ -1852,11 +1852,61 @@ def gradcam_comparison_dashboard(
 # 9. Metadata Filter Dashboard
 # -------------------------------------------------------------------------
 
+class MetadataFilterDashboard:
+    """
+    Container class for the metadata filter dashboard that provides access
+    to the filtered/exported DataFrame.
+
+    Attributes
+    ----------
+    widget : VBox
+        The dashboard widget to display.
+    exported_df : pd.DataFrame or None
+        The DataFrame that was last exported via the Export CSV button.
+
+    Methods
+    -------
+    get_filtered_df()
+        Returns the currently filtered DataFrame.
+    get_exported_df()
+        Returns the last exported DataFrame.
+    """
+
+    def __init__(self):
+        self.widget = None
+        self.exported_df = None
+        self._state = None
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        """Return the currently filtered DataFrame."""
+        if self._state is not None:
+            return self._state.get("filtered_df", pd.DataFrame())
+        return pd.DataFrame()
+
+    def get_exported_df(self) -> pd.DataFrame:
+        """Return the last exported DataFrame."""
+        if self.exported_df is not None:
+            return self.exported_df
+        return pd.DataFrame()
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Allow the dashboard to be displayed directly in Jupyter."""
+        if self.widget is not None:
+            return self.widget._repr_mimebundle_(**kwargs)
+        return {"text/plain": "Dashboard not initialized"}
+
+    def _ipython_display_(self):
+        """Display the dashboard widget in IPython/Jupyter."""
+        if self.widget is not None:
+            from IPython.display import display
+            display(self.widget)
+
+
 def metadata_filter_dashboard(
     df: pd.DataFrame,
     filter_columns: Optional[List[str]] = None,
     on_filter_callback: Optional[Callable[[pd.DataFrame], None]] = None,
-) -> VBox:
+) -> MetadataFilterDashboard:
     """
     Interactive dashboard to filter XNAT metadata and create data subsets.
 
@@ -1879,28 +1929,41 @@ def metadata_filter_dashboard(
 
     Returns
     -------
-    ipywidgets.VBox
-        The dashboard widget containing filters and visualizations.
+    MetadataFilterDashboard
+        A dashboard object that can be displayed and provides access to filtered data.
+        - Display the dashboard by putting it as the last line in a cell or using display()
+        - Access the current filtered DataFrame via dashboard.get_filtered_df()
+        - Access the last exported DataFrame via dashboard.get_exported_df()
 
     Examples
     --------
     >>> from src.utils.xnat_voila_dashboards import metadata_filter_dashboard
     >>> dashboard = metadata_filter_dashboard(meta_df)
-    >>> dashboard
+    >>> dashboard  # displays the dashboard
 
-    With callback to capture filtered data:
+    Access filtered data for downstream use:
+    >>> dashboard = metadata_filter_dashboard(meta_df)
+    >>> # ... user interacts with filters ...
+    >>> filtered_df = dashboard.get_filtered_df()  # get current filtered data
+    >>> exported_df = dashboard.get_exported_df()  # get last exported data
+
+    With callback to capture filtered data on every change:
     >>> filtered_data = {}
     >>> def capture_filter(df):
     ...     filtered_data['current'] = df
     >>> dashboard = metadata_filter_dashboard(meta_df, on_filter_callback=capture_filter)
     """
+    # Create the dashboard container object
+    dashboard_obj = MetadataFilterDashboard()
+
     if df is None or df.empty:
-        return VBox([
+        dashboard_obj.widget = VBox([
             widgets.HTML(
                 "<p style='color: orange;'>No data provided. "
                 "Please pass a valid DataFrame.</p>"
             )
         ])
+        return dashboard_obj
 
     # State to hold current filtered DataFrame and active filters
     state = {
@@ -1908,6 +1971,9 @@ def metadata_filter_dashboard(
         "original_df": df.copy(),
         "active_filter_columns": [],
     }
+
+    # Link state to dashboard object for external access
+    dashboard_obj._state = state
 
     # -------------------------------------------------------------------------
     # Helper: Get all filterable columns
@@ -1959,12 +2025,13 @@ def metadata_filter_dashboard(
     state["active_filter_columns"] = _get_default_filter_columns(df)
 
     if not all_filterable_columns:
-        return VBox([
+        dashboard_obj.widget = VBox([
             widgets.HTML(
                 "<p style='color: orange;'>No suitable columns found for filtering. "
                 "The DataFrame may have too few categorical columns.</p>"
             )
         ])
+        return dashboard_obj
 
     # -------------------------------------------------------------------------
     # Filter widget creation and management
@@ -2093,7 +2160,7 @@ def metadata_filter_dashboard(
         progress_pct = min(100, pct)
 
         html = f"""
-        <div style="background: linear-gradient(135deg, #1a365d 0%, #2c5282 100%);
+        <div style="background: linear-gradient(to right, #1a365d 0%, #2c5282 25%, #d69e2e 50%, #48bb78 75%, #276749 100%);
                     padding: 20px; border-radius: 8px; margin-bottom: 15px; color: white;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                 <div>
@@ -2435,7 +2502,7 @@ def metadata_filter_dashboard(
         _update()
 
     def _export_csv(btn):
-        """Export the filtered DataFrame to CSV."""
+        """Export the filtered DataFrame to CSV and store for downstream use."""
         from datetime import datetime
         from pathlib import Path
 
@@ -2452,10 +2519,15 @@ def metadata_filter_dashboard(
         filename = export_dir / f"filtered_metadata_{timestamp}.csv"
 
         export_cols = [c for c in filtered.columns if c != "dicom_files_sample"]
-        filtered[export_cols].to_csv(filename, index=False)
+        exported_df = filtered[export_cols].copy()
+        exported_df.to_csv(filename, index=False)
+
+        # Store the exported DataFrame in the dashboard object for downstream access
+        dashboard_obj.exported_df = exported_df
 
         with out_table:
-            print(f"\n✓ Exported {len(filtered):,} records to: {filename}")
+            print(f"\n✓ Exported {len(exported_df):,} records to: {filename}")
+            print(f"   Access via: dashboard.get_exported_df()")
 
     reset_btn.on_click(_reset_filters)
     export_btn.on_click(_export_csv)
@@ -2542,11 +2614,14 @@ def metadata_filter_dashboard(
         width="100%",
     ))
 
-    dashboard = VBox([
+    dashboard_widget = VBox([
         summary_cards_html,
         content_row,
     ], layout=widgets.Layout(
         width="100%",
     ))
 
-    return dashboard
+    # Attach the widget to the dashboard object
+    dashboard_obj.widget = dashboard_widget
+
+    return dashboard_obj
