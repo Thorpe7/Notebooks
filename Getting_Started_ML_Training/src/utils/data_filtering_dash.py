@@ -127,6 +127,21 @@ def data_filter_dashboard(
         ])
         return dashboard_obj
 
+    # Preprocess: compute derived columns for filtering
+    df = df.copy()
+
+    # Compute voxel volume if pixel spacing and slice thickness are available
+    has_pixel_spacing = ("pixel_spacing_row" in df.columns and "pixel_spacing_col" in df.columns)
+    has_slice_thickness = "slice_thickness" in df.columns
+
+    if has_pixel_spacing and has_slice_thickness:
+        df["voxel_volume_mm3"] = (
+            df["pixel_spacing_row"] * df["pixel_spacing_col"] * df["slice_thickness"]
+        )
+    elif has_pixel_spacing:
+        # Compute pixel area if no slice thickness
+        df["pixel_area_mm2"] = df["pixel_spacing_row"] * df["pixel_spacing_col"]
+
     # State to hold current filtered DataFrame and active filters
     state = {
         "filtered_df": df.copy(),
@@ -172,9 +187,11 @@ def data_filter_dashboard(
 
         all_cols = _get_all_filterable_columns(dataframe)
 
-        # Prioritize certain columns
+        # Prioritize certain columns (removed project_id, added imaging-specific filters)
         priority = [
-            "project_name", "project_id", "modality", "gender", "scan_type",
+            "project_name", "modality", "slice_thickness",
+            "pixel_spacing_row", "pixel_spacing_col", "voxel_volume_mm3",
+            "pixel_area_mm2", "gender", "scan_type",
             "manufacturer", "body_part_examined", "photometric_interpretation",
             "bits_stored", "rows", "columns", "num_slices"
         ]
@@ -501,8 +518,10 @@ def data_filter_dashboard(
 
     def _plot_numeric_histograms(filtered: pd.DataFrame):
         """Plot histograms for numeric columns."""
-        numeric_cols = ["rows", "columns", "num_slices", "pixel_spacing_row",
-                       "pixel_spacing_col", "slice_thickness", "age", "bits_stored",
+        # Prioritize imaging-specific metrics
+        numeric_cols = ["slice_thickness", "pixel_spacing_row", "pixel_spacing_col",
+                       "voxel_volume_mm3", "pixel_area_mm2",
+                       "rows", "columns", "num_slices", "age", "bits_stored",
                        "window_center", "window_width"]
         numeric_cols = [c for c in numeric_cols if c in filtered.columns and
                        np.issubdtype(filtered[c].dtype, np.number) and
