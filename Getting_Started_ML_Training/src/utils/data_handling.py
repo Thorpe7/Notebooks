@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 from typing import Dict, Any, Iterable, List, Optional, Union
@@ -295,21 +296,24 @@ def _discover_dicom_tags(ds: pydicom.Dataset) -> Dict[str, str]:
     return tags
 
 
-def _extract_dicom_image_metrics(
-    scan_path: Path,
+def _extract_dicom_image_metrics_from_xnat(
+    scan,
     known_tags: Dict[str, str],
     seen_modalities: set,
 ) -> tuple[Dict[str, Any], Dict[str, str]]:
     """
-    Extract image metrics from the first DICOM file found in a scan directory.
+    Extract image metrics from the first DICOM file in an XNATpy scan object.
+
+    Uses XNATpy to download DICOM content directly, without requiring
+    filesystem access to mounted data.
 
     Dynamically discovers DICOM tags based on modality/scan type. For new
     modalities, all available tags are discovered and added to known_tags.
 
     Parameters
     ----------
-    scan_path : Path
-        Path to the scan directory (e.g., /data/projects/.../SCANS/1)
+    scan : xnat scan object
+        An XNATpy scan object from which to extract DICOM metadata.
     known_tags : Dict[str, str]
         Dictionary mapping column names to DICOM keywords. Updated in place
         when new modalities are discovered.
@@ -325,24 +329,37 @@ def _extract_dicom_image_metrics(
     metrics: Dict[str, Any] = {col: None for col in known_tags}
     metrics["num_slices"] = None
 
-    # Find DICOM files in the scan directory
-    dcm_files = []
-    for subdir in ["DICOM", "secondary", "NIFTI", ""]:
-        search_path = scan_path / subdir if subdir else scan_path
-        if search_path.exists():
-            dcm_files.extend(list(search_path.glob("*.dcm")))
-            if dcm_files:
-                break
+    # Find DICOM files via XNATpy resources
+    dicom_file = None
+    dicom_file_count = 0
 
-    if not dcm_files:
+    try:
+        # Iterate through resources (DICOM, secondary, etc.)
+        for resource in scan.resources.values():
+            resource_label = getattr(resource, "label", "").upper()
+
+            # Prefer DICOM or secondary resources
+            for file_obj in resource.files.values():
+                file_name = getattr(file_obj, "name", "") or getattr(file_obj, "label", "")
+                if file_name.lower().endswith(".dcm"):
+                    dicom_file_count += 1
+                    # Keep the first DICOM file for metadata extraction
+                    if dicom_file is None:
+                        dicom_file = file_obj
+    except Exception:
         return metrics, known_tags
 
-    # Count total slices
-    metrics["num_slices"] = len(dcm_files)
+    if dicom_file is None:
+        return metrics, known_tags
 
-    # Read the first DICOM file
+    # Record the file count
+    metrics["num_slices"] = dicom_file_count
+
+    # Download and read the DICOM file
     try:
-        ds = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
+        # Download file content to bytes
+        dicom_bytes = dicom_file.download_stream().read()
+        ds = pydicom.dcmread(io.BytesIO(dicom_bytes), stop_before_pixels=True)
     except Exception:
         return metrics, known_tags
 
@@ -437,8 +454,9 @@ def fetch_xnat_metadata(
     password : str, optional
         XNAT password. Defaults to XNAT_PASS environment variable.
     include_dicom_metrics : bool, default True
-        If True, reads a sample DICOM file from each scan to extract additional
-        image metrics (resolution, pixel spacing, bits, acquisition parameters, etc.).
+        If True, downloads a sample DICOM file from each scan via XNATpy to extract
+        additional image metrics (resolution, pixel spacing, bits, acquisition
+        parameters, etc.). Does not require mounted filesystem access.
         Set to False for faster metadata retrieval when image metrics aren't needed.
     save_csv : bool, default False
         If True and csv_filename is provided, saves the DataFrame to a CSV file.
@@ -477,11 +495,8 @@ def fetch_xnat_metadata(
         - scan_type: Type/series description of the scan
         - scan_quality: Quality rating of the scan
         - scan_note: Notes associated with the scan
-        - file_path: Mounted file path to the scan's DICOM directory
-        - dicom_file_count: Number of DICOM files found via XNATpy
-        - dicom_files_sample: List of up to 3 sample DICOM file paths
 
-        Image metrics (when include_dicom_metrics=True):
+        Image metrics (when include_dicom_metrics=True, fetched via XNATpy):
         - rows, columns: Image dimensions in pixels
         - num_slices: Number of DICOM files/slices in the scan
         - pixel_spacing_row, pixel_spacing_col: Pixel spacing in mm
@@ -635,52 +650,10 @@ def fetch_xnat_metadata(
                             "scan_note": getattr(scan, "note", None),
                         }
 
-                        # Get file paths from XNATpy resources
-                        dicom_files: List[str] = []
-                        scan_dir_path = None
-
-                        # Iterate through resources (DICOM, secondary, etc.)
-                        try:
-                            for resource in scan.resources.values():
-                                resource_label = getattr(resource, "label", "")
-                                for file_obj in resource.files.values():
-                                    # Get the URI which maps to the mounted path
-                                    file_uri = getattr(file_obj, "uri", None)
-                                    if file_uri:
-                                        # Convert URI to mounted path
-                                        # URI format: /data/experiments/.../scans/.../resources/.../files/...
-                                        # Mounted path: /data/projects/.../experiments/.../SCANS/.../DICOM/...
-                                        file_path = f"/data{file_uri}" if not file_uri.startswith("/data") else file_uri
-
-                                        # Check if it's a DICOM file
-                                        if file_path.lower().endswith(".dcm"):
-                                            dicom_files.append(file_path)
-
-                                            # Extract the scan directory from the first file
-                                            if scan_dir_path is None:
-                                                scan_dir_path = str(Path(file_path).parent)
-                        except Exception:
-                            # Fall back to constructed path if resource iteration fails
-                            pass
-
-                        # Fall back to constructed path if no files found via XNATpy
-                        if scan_dir_path is None:
-                            scan_dir_path = (
-                                f"/data/projects/{project_id}/experiments/"
-                                f"{experiment.label}/SCANS/{scan.id}"
-                            )
-
-                        scan_record["file_path"] = scan_dir_path
-                        scan_record["dicom_file_count"] = len(dicom_files) if dicom_files else None
-
-                        # Store first few DICOM file paths for reference
-                        if dicom_files:
-                            scan_record["dicom_files_sample"] = dicom_files[:3]
-
-                        # Extract DICOM image metrics if requested
+                        # Extract DICOM image metrics if requested (uses XNATpy directly)
                         if include_dicom_metrics:
-                            dicom_metrics, known_tags = _extract_dicom_image_metrics(
-                                Path(scan_dir_path),
+                            dicom_metrics, known_tags = _extract_dicom_image_metrics_from_xnat(
+                                scan,
                                 known_tags,
                                 seen_modalities,
                             )
