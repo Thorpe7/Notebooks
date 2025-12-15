@@ -298,54 +298,39 @@ def _discover_dicom_tags(ds: pydicom.Dataset) -> Dict[str, str]:
     return tags
 
 
-def _download_dicom_from_xnat(file_obj) -> Optional[bytes]:
+def _read_dicom_header_from_xnat(
+    file_obj,
+    verbose: bool = False
+) -> Optional[pydicom.Dataset]:
     """
-    Try multiple methods to download DICOM content from XNATpy file object.
+    Read DICOM header from XNATpy file object using streaming.
 
-    Returns the file bytes if successful, None otherwise.
+    Uses file_obj.open() with pydicom's stop_before_pixels=True to read
+    only the DICOM header without downloading the entire file.
+
+    Parameters
+    ----------
+    file_obj : XNATpy file object
+        The file object from scan.resources[].files[]
+    verbose : bool
+        If True, print status messages
+
+    Returns
+    -------
+    pydicom.Dataset or None
+        The DICOM dataset (header only) if successful, None otherwise.
     """
-    import tempfile
-
-    # Method 1: download_stream (newer XNATpy)
-    if hasattr(file_obj, 'download_stream'):
+    # Use file.open() streaming with pydicom (confirmed working method)
+    if hasattr(file_obj, 'open'):
         try:
-            stream = file_obj.download_stream()
-            if hasattr(stream, 'read'):
-                return stream.read()
-            return stream
+            with file_obj.open() as fin:
+                ds = pydicom.dcmread(fin, stop_before_pixels=True)
+            if verbose:
+                print(f"    Read DICOM header via file.open() streaming")
+            return ds
         except Exception as e:
-            pass  # Try next method
-
-    # Method 2: get() method
-    if hasattr(file_obj, 'get'):
-        try:
-            content = file_obj.get()
-            if isinstance(content, bytes):
-                return content
-        except Exception:
-            pass
-
-    # Method 3: download to temp file
-    if hasattr(file_obj, 'download'):
-        try:
-            with tempfile.NamedTemporaryFile(suffix='.dcm', delete=False) as tmp:
-                tmp_path = tmp.name
-            file_obj.download(tmp_path)
-            with open(tmp_path, 'rb') as f:
-                content = f.read()
-            os.unlink(tmp_path)
-            return content
-        except Exception:
-            pass
-
-    # Method 4: data property
-    if hasattr(file_obj, 'data'):
-        try:
-            data = file_obj.data
-            if isinstance(data, bytes):
-                return data
-        except Exception:
-            pass
+            if verbose:
+                print(f"    file.open() failed: {e}")
 
     return None
 
@@ -360,8 +345,8 @@ def _extract_dicom_image_metrics_from_xnat(
     """
     Extract image metrics from the first DICOM file in an XNATpy scan object.
 
-    Uses XNATpy to download DICOM content directly, without requiring
-    filesystem access to mounted data.
+    Uses XNATpy's file.open() streaming with pydicom's stop_before_pixels=True
+    to read only the DICOM header without downloading the entire file.
 
     Dynamically discovers DICOM tags based on modality/scan type. For new
     modalities, all available tags are discovered and added to known_tags.
@@ -393,6 +378,7 @@ def _extract_dicom_image_metrics_from_xnat(
     # Find DICOM files via XNATpy resources
     dicom_file = None
     dicom_file_count = 0
+    dicom_file_id = None
     dicom_file_uri = None
     resource_label_used = None
 
@@ -400,19 +386,32 @@ def _extract_dicom_image_metrics_from_xnat(
         # Iterate through resources (DICOM, secondary, etc.)
         for resource in scan.resources.values():
             resource_label = getattr(resource, "label", "")
+            resource_format = getattr(resource, "format", "")
 
-            for file_obj in resource.files.values():
-                file_name = getattr(file_obj, "name", "") or getattr(file_obj, "label", "")
-                if file_name.lower().endswith(".dcm"):
+            # Check if this is a DICOM resource
+            is_dicom_resource = resource_label.upper() in ["DICOM", "SECONDARY"] or \
+                                resource_format.upper() == "DICOM"
+
+            for file_key, file_obj in resource.files.items():
+                # Get file identifier from id, path, or key
+                file_id = getattr(file_obj, "id", None) or \
+                          getattr(file_obj, "path", None) or \
+                          str(file_key)
+
+                # Check if it's a DICOM file
+                is_dicom_file = file_id.lower().endswith(".dcm") or is_dicom_resource
+
+                if is_dicom_file:
                     dicom_file_count += 1
                     # Keep the first DICOM file for metadata extraction
                     if dicom_file is None:
                         dicom_file = file_obj
+                        dicom_file_id = file_id
                         resource_label_used = resource_label
-                        # Try to get URI/path for logging
-                        dicom_file_uri = getattr(file_obj, 'uri', None) or getattr(file_obj, 'path', None)
-                        if dicom_file_uri is None:
-                            dicom_file_uri = f"{resource_label}/{file_name}"
+                        dicom_file_uri = getattr(file_obj, 'uri', None) or \
+                                         getattr(file_obj, 'path', None) or \
+                                         f"{resource_label}/{file_id}"
+
     except Exception as e:
         if verbose:
             print(f"  [ERROR] Failed to enumerate resources for scan {getattr(scan, 'id', '?')}: {e}")
@@ -433,34 +432,20 @@ def _extract_dicom_image_metrics_from_xnat(
     # Record the file count
     metrics["num_slices"] = dicom_file_count
 
-    # Download and read the DICOM file
-    dicom_bytes = _download_dicom_from_xnat(dicom_file)
+    # Read DICOM header using streaming (no full file download)
+    ds = _read_dicom_header_from_xnat(dicom_file, verbose=verbose)
 
-    if dicom_bytes is None:
+    if ds is None:
         if verbose:
-            print(f"  [ERROR] Failed to download DICOM from {dicom_file_uri}")
+            print(f"  [ERROR] Failed to read DICOM header from {dicom_file_uri}")
         if discovery_log is not None:
             discovery_log.append({
                 "event": "error",
                 "scan_id": getattr(scan, 'id', None),
-                "error_type": "download_failed",
+                "error_type": "read_header_failed",
                 "file_uri": dicom_file_uri,
-                "error_message": "All download methods failed",
-            })
-        return metrics, known_tags
-
-    try:
-        ds = pydicom.dcmread(io.BytesIO(dicom_bytes), stop_before_pixels=True)
-    except Exception as e:
-        if verbose:
-            print(f"  [ERROR] Failed to parse DICOM from {dicom_file_uri}: {e}")
-        if discovery_log is not None:
-            discovery_log.append({
-                "event": "error",
-                "scan_id": getattr(scan, 'id', None),
-                "error_type": "parse_failed",
-                "file_uri": dicom_file_uri,
-                "error_message": str(e),
+                "file_id": dicom_file_id,
+                "error_message": "file.open() streaming failed",
             })
         return metrics, known_tags
 
@@ -491,6 +476,7 @@ def _extract_dicom_image_metrics_from_xnat(
             print(f"  Modality:       {modality}")
             print(f"  SOP Class:      {sop_class_name}")
             print(f"  SOP Class UID:  {sop_class_uid}")
+            print(f"  File ID:        {dicom_file_id}")
             print(f"  File URI:       {dicom_file_uri}")
             print(f"  Resource:       {resource_label_used}")
             print(f"  New headers ({len(newly_added_tags)}): {newly_added_tags[:20]}")
@@ -505,6 +491,7 @@ def _extract_dicom_image_metrics_from_xnat(
                 "sop_class_name": sop_class_name,
                 "sop_class_uid": str(sop_class_uid),
                 "scan_type_key": scan_type_key,
+                "file_id": dicom_file_id,
                 "file_uri": dicom_file_uri,
                 "resource_label": resource_label_used,
                 "new_headers_count": len(newly_added_tags),
