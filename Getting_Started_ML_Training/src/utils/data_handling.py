@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Iterable, List, Optional, Union
 
@@ -296,10 +298,64 @@ def _discover_dicom_tags(ds: pydicom.Dataset) -> Dict[str, str]:
     return tags
 
 
+def _download_dicom_from_xnat(file_obj) -> Optional[bytes]:
+    """
+    Try multiple methods to download DICOM content from XNATpy file object.
+
+    Returns the file bytes if successful, None otherwise.
+    """
+    import tempfile
+
+    # Method 1: download_stream (newer XNATpy)
+    if hasattr(file_obj, 'download_stream'):
+        try:
+            stream = file_obj.download_stream()
+            if hasattr(stream, 'read'):
+                return stream.read()
+            return stream
+        except Exception as e:
+            pass  # Try next method
+
+    # Method 2: get() method
+    if hasattr(file_obj, 'get'):
+        try:
+            content = file_obj.get()
+            if isinstance(content, bytes):
+                return content
+        except Exception:
+            pass
+
+    # Method 3: download to temp file
+    if hasattr(file_obj, 'download'):
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.dcm', delete=False) as tmp:
+                tmp_path = tmp.name
+            file_obj.download(tmp_path)
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            os.unlink(tmp_path)
+            return content
+        except Exception:
+            pass
+
+    # Method 4: data property
+    if hasattr(file_obj, 'data'):
+        try:
+            data = file_obj.data
+            if isinstance(data, bytes):
+                return data
+        except Exception:
+            pass
+
+    return None
+
+
 def _extract_dicom_image_metrics_from_xnat(
     scan,
     known_tags: Dict[str, str],
     seen_modalities: set,
+    discovery_log: Optional[List[Dict[str, Any]]] = None,
+    verbose: bool = False,
 ) -> tuple[Dict[str, Any], Dict[str, str]]:
     """
     Extract image metrics from the first DICOM file in an XNATpy scan object.
@@ -319,6 +375,11 @@ def _extract_dicom_image_metrics_from_xnat(
         when new modalities are discovered.
     seen_modalities : set
         Set of modalities/scan types already processed. Updated in place.
+    discovery_log : list, optional
+        If provided, appends discovery events with scan type info, paths,
+        and new headers found.
+    verbose : bool, default False
+        If True, prints status messages during extraction.
 
     Returns
     -------
@@ -332,13 +393,14 @@ def _extract_dicom_image_metrics_from_xnat(
     # Find DICOM files via XNATpy resources
     dicom_file = None
     dicom_file_count = 0
+    dicom_file_uri = None
+    resource_label_used = None
 
     try:
         # Iterate through resources (DICOM, secondary, etc.)
         for resource in scan.resources.values():
-            resource_label = getattr(resource, "label", "").upper()
+            resource_label = getattr(resource, "label", "")
 
-            # Prefer DICOM or secondary resources
             for file_obj in resource.files.values():
                 file_name = getattr(file_obj, "name", "") or getattr(file_obj, "label", "")
                 if file_name.lower().endswith(".dcm"):
@@ -346,38 +408,109 @@ def _extract_dicom_image_metrics_from_xnat(
                     # Keep the first DICOM file for metadata extraction
                     if dicom_file is None:
                         dicom_file = file_obj
-    except Exception:
+                        resource_label_used = resource_label
+                        # Try to get URI/path for logging
+                        dicom_file_uri = getattr(file_obj, 'uri', None) or getattr(file_obj, 'path', None)
+                        if dicom_file_uri is None:
+                            dicom_file_uri = f"{resource_label}/{file_name}"
+    except Exception as e:
+        if verbose:
+            print(f"  [ERROR] Failed to enumerate resources for scan {getattr(scan, 'id', '?')}: {e}")
+        if discovery_log is not None:
+            discovery_log.append({
+                "event": "error",
+                "scan_id": getattr(scan, 'id', None),
+                "error_type": "resource_enumeration",
+                "error_message": str(e),
+            })
         return metrics, known_tags
 
     if dicom_file is None:
+        if verbose:
+            print(f"  [WARN] No DICOM files found for scan {getattr(scan, 'id', '?')}")
         return metrics, known_tags
 
     # Record the file count
     metrics["num_slices"] = dicom_file_count
 
     # Download and read the DICOM file
+    dicom_bytes = _download_dicom_from_xnat(dicom_file)
+
+    if dicom_bytes is None:
+        if verbose:
+            print(f"  [ERROR] Failed to download DICOM from {dicom_file_uri}")
+        if discovery_log is not None:
+            discovery_log.append({
+                "event": "error",
+                "scan_id": getattr(scan, 'id', None),
+                "error_type": "download_failed",
+                "file_uri": dicom_file_uri,
+                "error_message": "All download methods failed",
+            })
+        return metrics, known_tags
+
     try:
-        # Download file content to bytes
-        dicom_bytes = dicom_file.download_stream().read()
         ds = pydicom.dcmread(io.BytesIO(dicom_bytes), stop_before_pixels=True)
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f"  [ERROR] Failed to parse DICOM from {dicom_file_uri}: {e}")
+        if discovery_log is not None:
+            discovery_log.append({
+                "event": "error",
+                "scan_id": getattr(scan, 'id', None),
+                "error_type": "parse_failed",
+                "file_uri": dicom_file_uri,
+                "error_message": str(e),
+            })
         return metrics, known_tags
 
     # Determine modality/scan type for tag discovery
     modality = getattr(ds, 'Modality', 'UNKNOWN')
-    sop_class = getattr(ds, 'SOPClassUID', '')
-    scan_type_key = f"{modality}_{sop_class}"
+    sop_class_uid = getattr(ds, 'SOPClassUID', '')
+    sop_class_name = str(sop_class_uid.name) if hasattr(sop_class_uid, 'name') else str(sop_class_uid)
+    scan_type_key = f"{modality}_{sop_class_uid}"
 
     # If this is a new modality/scan type, discover all available tags
     if scan_type_key not in seen_modalities:
         seen_modalities.add(scan_type_key)
         new_tags = _discover_dicom_tags(ds)
 
-        # Add new tags to known_tags
+        # Track which tags are actually new
+        newly_added_tags = []
         for col_name, keyword in new_tags.items():
             if col_name not in known_tags:
                 known_tags[col_name] = keyword
                 metrics[col_name] = None  # Initialize in current metrics
+                newly_added_tags.append(col_name)
+
+        # Log the discovery
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"NEW SCAN TYPE DISCOVERED")
+            print(f"{'='*60}")
+            print(f"  Modality:       {modality}")
+            print(f"  SOP Class:      {sop_class_name}")
+            print(f"  SOP Class UID:  {sop_class_uid}")
+            print(f"  File URI:       {dicom_file_uri}")
+            print(f"  Resource:       {resource_label_used}")
+            print(f"  New headers ({len(newly_added_tags)}): {newly_added_tags[:20]}")
+            if len(newly_added_tags) > 20:
+                print(f"                  ... and {len(newly_added_tags) - 20} more")
+            print(f"{'='*60}\n")
+
+        if discovery_log is not None:
+            discovery_log.append({
+                "event": "new_scan_type",
+                "modality": modality,
+                "sop_class_name": sop_class_name,
+                "sop_class_uid": str(sop_class_uid),
+                "scan_type_key": scan_type_key,
+                "file_uri": dicom_file_uri,
+                "resource_label": resource_label_used,
+                "new_headers_count": len(newly_added_tags),
+                "new_headers": newly_added_tags,
+                "total_known_tags": len(known_tags),
+            })
 
     # Extract values for all known tags
     for col_name, keyword in known_tags.items():
@@ -425,6 +558,7 @@ def fetch_xnat_metadata(
     save_csv: bool = False,
     csv_filename: Optional[str] = None,
     save_dir: str = "logs/saved_df",
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """
     Fetch demographic and DICOM metadata from one or more XNAT projects using XNATpy.
@@ -467,6 +601,10 @@ def fetch_xnat_metadata(
         save_csv=True. Example: "my_metadata" or "my_metadata.csv"
     save_dir : str, default "logs/saved_df"
         Directory where the CSV file will be saved/loaded from.
+    verbose : bool, default False
+        If True, prints detailed status messages during DICOM metadata extraction,
+        including when new scan types are discovered. Also saves a JSON log file
+        with discovery details (scan types found, file URIs used, headers discovered).
 
     Returns
     -------
@@ -606,6 +744,15 @@ def fetch_xnat_metadata(
         }
         seen_modalities: set = set()
 
+        # Discovery log for tracking new scan types and metadata headers
+        discovery_log: List[Dict[str, Any]] = []
+
+        if verbose:
+            print(f"\n{'#'*60}")
+            print(f"# XNAT METADATA EXTRACTION - VERBOSE MODE")
+            print(f"# Projects: {project_ids}")
+            print(f"{'#'*60}\n")
+
         # Iterate through all requested projects
         for project_id in project_ids:
             # Validate project exists
@@ -656,6 +803,8 @@ def fetch_xnat_metadata(
                                 scan,
                                 known_tags,
                                 seen_modalities,
+                                discovery_log=discovery_log,
+                                verbose=verbose,
                             )
                             scan_record.update(dicom_metrics)
 
@@ -695,6 +844,42 @@ def fetch_xnat_metadata(
         if csv_path is not None:
             df.to_csv(csv_path, index=False)
             print(f"Saved metadata to: {csv_path}")
+
+        # Save discovery log if there are entries
+        if discovery_log and (verbose or save_csv):
+            save_path = Path(save_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_filename = csv_filename.replace(".csv", "") if csv_filename else "metadata"
+            log_path = save_path / f"{log_filename}_discovery_log_{timestamp}.json"
+
+            # Add summary to the log
+            discovery_summary = {
+                "extraction_timestamp": timestamp,
+                "projects": project_ids if isinstance(project_ids, list) else [project_ids],
+                "total_records": len(records),
+                "total_scan_types_discovered": len([e for e in discovery_log if e.get("event") == "new_scan_type"]),
+                "total_errors": len([e for e in discovery_log if e.get("event") == "error"]),
+                "final_column_count": len(known_tags),
+                "all_discovered_columns": list(known_tags.keys()),
+                "events": discovery_log,
+            }
+
+            with open(log_path, "w") as f:
+                json.dump(discovery_summary, f, indent=2, default=str)
+
+            print(f"Saved discovery log to: {log_path}")
+
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"EXTRACTION SUMMARY")
+                print(f"{'='*60}")
+                print(f"  Total records:        {len(records)}")
+                print(f"  Scan types found:     {discovery_summary['total_scan_types_discovered']}")
+                print(f"  Errors encountered:   {discovery_summary['total_errors']}")
+                print(f"  Total columns:        {len(known_tags)}")
+                print(f"{'='*60}\n")
 
         return df
 
