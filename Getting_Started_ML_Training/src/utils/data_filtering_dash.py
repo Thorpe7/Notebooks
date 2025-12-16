@@ -399,51 +399,12 @@ def data_filter_dashboard(
                 plot_toggle.observe(_make_toggle_handler(col), names="value")
                 plot_toggle_widgets[col] = plot_toggle
 
-                # Create move up/down buttons (compact)
-                up_btn = widgets.Button(
-                    description="↑",
-                    layout=widgets.Layout(width="20px", height="18px", padding="0", font_size="10px"),
-                    disabled=(idx == 0),
+                # Clean header with just the title (no buttons)
+                header_container = widgets.HTML(
+                    f"<div style='font-weight: bold; font-size: 11px; color: white; "
+                    f"background: #2c3e50; padding: 6px 10px; border-radius: 4px 4px 0 0;'>"
+                    f"{col.replace('_', ' ').title()}</div>"
                 )
-                down_btn = widgets.Button(
-                    description="↓",
-                    layout=widgets.Layout(width="20px", height="18px", padding="0"),
-                    disabled=(idx == num_filters - 1),
-                )
-                remove_btn = widgets.Button(
-                    description="×",
-                    button_style="danger",
-                    layout=widgets.Layout(width="20px", height="18px", padding="0"),
-                )
-
-                def _make_move_handler(column, direction):
-                    def handler(btn):
-                        _move_filter(column, direction)
-                    return handler
-
-                def _make_remove_handler(column):
-                    def handler(btn):
-                        _remove_filter(column)
-                    return handler
-
-                up_btn.on_click(_make_move_handler(col, -1))
-                down_btn.on_click(_make_move_handler(col, 1))
-                remove_btn.on_click(_make_remove_handler(col))
-
-                # Header with title and control buttons
-                header_container = HBox([
-                    widgets.HTML(
-                        f"<div style='font-weight: bold; font-size: 11px; color: white; flex: 1;'>"
-                        f"{col.replace('_', ' ').title()}</div>"
-                    ),
-                    HBox([up_btn, down_btn, remove_btn], layout=widgets.Layout(gap="2px")),
-                ], layout=widgets.Layout(
-                    justify_content="space-between",
-                    align_items="center",
-                    background="#2c3e50",
-                    padding="4px 8px",
-                    border_radius="4px 4px 0 0",
-                ))
 
                 # Toggle row below the filter
                 toggle_row = HBox([
@@ -610,6 +571,134 @@ def data_filter_dashboard(
     add_filter_container = VBox([
         open_search_btn,
         search_panel_container,
+    ])
+
+    # -------------------------------------------------------------------------
+    # Manage Filters section (reorder and remove)
+    # -------------------------------------------------------------------------
+    manage_state = {"is_open": False, "panel": None}
+    manage_filters_list = VBox()
+
+    def _rebuild_manage_filters_list():
+        """Rebuild the list of filters in the manage panel."""
+        items = []
+        num_filters = len(state["active_filter_columns"])
+
+        for idx, col in enumerate(state["active_filter_columns"]):
+            # Create compact row with filter name and controls
+            name_label = widgets.HTML(
+                f"<span style='font-size: 11px;'>{idx + 1}. {col.replace('_', ' ').title()}</span>"
+            )
+
+            up_btn = widgets.Button(
+                description="↑",
+                layout=widgets.Layout(width="24px", height="20px", padding="0"),
+                disabled=(idx == 0),
+            )
+            down_btn = widgets.Button(
+                description="↓",
+                layout=widgets.Layout(width="24px", height="20px", padding="0"),
+                disabled=(idx == num_filters - 1),
+            )
+            remove_btn = widgets.Button(
+                description="×",
+                button_style="danger",
+                layout=widgets.Layout(width="24px", height="20px", padding="0"),
+            )
+
+            def _make_move_handler(column, direction):
+                def handler(btn):
+                    _move_filter(column, direction)
+                    _rebuild_manage_filters_list()
+                return handler
+
+            def _make_remove_handler(column):
+                def handler(btn):
+                    _remove_filter(column)
+                    _rebuild_manage_filters_list()
+                return handler
+
+            up_btn.on_click(_make_move_handler(col, -1))
+            down_btn.on_click(_make_move_handler(col, 1))
+            remove_btn.on_click(_make_remove_handler(col))
+
+            row = HBox([
+                name_label,
+                HBox([up_btn, down_btn, remove_btn], layout=widgets.Layout(gap="2px")),
+            ], layout=widgets.Layout(
+                justify_content="space-between",
+                align_items="center",
+                padding="3px 5px",
+                border_bottom="1px solid #eee",
+            ))
+            items.append(row)
+
+        if not items:
+            items = [widgets.HTML(
+                "<div style='padding: 10px; color: #666; font-style: italic;'>"
+                "No active filters</div>"
+            )]
+
+        manage_filters_list.children = items
+
+    def _hide_manage_panel():
+        """Hide the manage filters panel."""
+        manage_state["is_open"] = False
+        if manage_state["panel"] is not None:
+            manage_state["panel"].layout.display = "none"
+
+    def _show_manage_panel():
+        """Show the manage filters panel."""
+        manage_state["is_open"] = True
+        if manage_state["panel"] is not None:
+            manage_state["panel"].layout.display = "block"
+        _rebuild_manage_filters_list()
+
+    def _toggle_manage_panel(b):
+        if manage_state["is_open"]:
+            _hide_manage_panel()
+        else:
+            _show_manage_panel()
+
+    manage_filters_btn = widgets.Button(
+        description="⚙ Manage Filters",
+        button_style="",
+        layout=widgets.Layout(width="100%", margin="5px 0 0 0"),
+    )
+    manage_filters_btn.on_click(_toggle_manage_panel)
+
+    manage_close_btn = widgets.Button(
+        description="Close",
+        button_style="",
+        layout=widgets.Layout(width="50px", height="20px", padding="0"),
+    )
+    manage_close_btn.on_click(lambda b: _hide_manage_panel())
+
+    manage_panel_header = HBox([
+        widgets.HTML("<span style='font-size: 11px; font-weight: bold;'>Reorder / Remove</span>"),
+        manage_close_btn,
+    ], layout=widgets.Layout(justify_content="space-between", align_items="center", padding="4px"))
+
+    manage_panel_container = VBox([
+        manage_panel_header,
+        manage_filters_list,
+    ], layout=widgets.Layout(
+        border="1px solid #ddd",
+        border_radius="4px",
+        padding="5px",
+        margin="5px 0 0 0",
+        background="#fafafa",
+        max_height="200px",
+        overflow_y="auto",
+        display="none",
+    ))
+
+    manage_state["panel"] = manage_panel_container
+
+    # Combined manage filters widget
+    manage_filter_container = VBox([
+        manage_filters_btn,
+        manage_panel_container,
     ])
 
     # -------------------------------------------------------------------------
@@ -1019,7 +1108,7 @@ def data_filter_dashboard(
         """<div style="background: #ecf0f1; padding: 8px 12px; border-bottom: 1px solid #bdc3c7;">
            <div style="font-weight: bold; font-size: 12px; color: #2c3e50;">Filters</div>
            <div style="font-size: 10px; color: #7f8c8d; margin-top: 2px;">
-               Use checkboxes to toggle plot visibility
+               Check 'Plot' to show in visualizations
            </div>
         </div>"""
     )
@@ -1029,6 +1118,7 @@ def data_filter_dashboard(
         filter_section_header,
         filter_container,
         add_filter_container,
+        manage_filter_container,
         widgets.HTML("<hr style='margin: 10px 0; border-color: #ecf0f1;'>"),
         reset_btn,
         export_btn,
