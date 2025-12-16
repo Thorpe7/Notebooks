@@ -399,24 +399,21 @@ def data_filter_dashboard(
                 plot_toggle.observe(_make_toggle_handler(col), names="value")
                 plot_toggle_widgets[col] = plot_toggle
 
-                # Create move up/down buttons
+                # Create move up/down buttons (compact)
                 up_btn = widgets.Button(
-                    description="",
-                    icon="arrow-up",
-                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                    description="↑",
+                    layout=widgets.Layout(width="20px", height="18px", padding="0", font_size="10px"),
                     disabled=(idx == 0),
                 )
                 down_btn = widgets.Button(
-                    description="",
-                    icon="arrow-down",
-                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                    description="↓",
+                    layout=widgets.Layout(width="20px", height="18px", padding="0"),
                     disabled=(idx == num_filters - 1),
                 )
                 remove_btn = widgets.Button(
-                    description="",
-                    icon="times",
+                    description="×",
                     button_style="danger",
-                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                    layout=widgets.Layout(width="20px", height="18px", padding="0"),
                 )
 
                 def _make_move_handler(column, direction):
@@ -471,21 +468,19 @@ def data_filter_dashboard(
     # -------------------------------------------------------------------------
     # Column selector for adding/removing filters (with search)
     # -------------------------------------------------------------------------
-    add_filter_dropdown = widgets.Dropdown(
-        options=[("+ Add Filter...", "")],
-        value="",
-        layout=widgets.Layout(width="100%", display="none"),  # Hidden, used programmatically
-    )
+
+    # State for search visibility
+    search_state = {"is_open": False, "panel": None}
 
     # Search input for filtering available columns
     filter_search_input = widgets.Text(
-        placeholder="Search filters...",
+        placeholder="Type to search...",
         layout=widgets.Layout(width="100%"),
     )
 
-    # Container for search results
+    # Container for search results (initially hidden)
     filter_search_results = VBox(layout=widgets.Layout(
-        max_height="200px",
+        max_height="250px",
         overflow_y="auto",
         width="100%",
     ))
@@ -493,6 +488,19 @@ def data_filter_dashboard(
     def _get_available_filters():
         """Get list of filters not currently active."""
         return [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
+
+    def _hide_search_panel():
+        """Hide the search panel."""
+        search_state["is_open"] = False
+        if search_state["panel"] is not None:
+            search_state["panel"].layout.display = "none"
+
+    def _show_search_panel():
+        """Show the search panel."""
+        search_state["is_open"] = True
+        if search_state["panel"] is not None:
+            search_state["panel"].layout.display = "block"
+        _update_search_results(filter_search_input.value)
 
     def _update_search_results(search_text: str = ""):
         """Update the search results based on search text."""
@@ -503,12 +511,12 @@ def data_filter_dashboard(
             # Filter by search text
             matches = [c for c in available if search_lower in c.lower().replace("_", " ")]
         else:
-            # Show first 10 when no search
-            matches = available[:10]
+            # Show all available when no search
+            matches = available
 
         # Create clickable buttons for each match
         result_buttons = []
-        for col in matches[:15]:  # Limit to 15 results
+        for col in matches[:20]:  # Limit to 20 results
             btn = widgets.Button(
                 description=col.replace("_", " ").title(),
                 layout=widgets.Layout(width="100%", margin="1px 0"),
@@ -520,7 +528,7 @@ def data_filter_dashboard(
                     if column not in state["active_filter_columns"]:
                         state["active_filter_columns"].append(column)
                         filter_search_input.value = ""
-                        _update_search_results("")
+                        _hide_search_panel()
                         _rebuild_filter_widgets()
                         _update()
                 return handler
@@ -539,39 +547,70 @@ def data_filter_dashboard(
                 "All filters are active</div>"
             )]
 
-        # Add count indicator
+        # Add count indicator and close button
+        header_items = []
         if available:
-            count_html = widgets.HTML(
-                f"<div style='padding: 4px 8px; font-size: 10px; color: #888;'>"
-                f"Showing {len(matches[:15])} of {len(available)} available filters</div>"
-            )
-            filter_search_results.children = [count_html] + result_buttons
-        else:
-            filter_search_results.children = result_buttons
+            header_items.append(widgets.HTML(
+                f"<div style='padding: 4px 0; font-size: 10px; color: #888;'>"
+                f"Showing {len(matches[:20])} of {len(available)} available</div>"
+            ))
+
+        close_btn = widgets.Button(
+            description="Close",
+            button_style="",
+            layout=widgets.Layout(width="60px", height="22px", padding="0"),
+        )
+        close_btn.on_click(lambda b: _hide_search_panel())
+
+        header_row = HBox([
+            header_items[0] if header_items else widgets.HTML(""),
+            close_btn,
+        ], layout=widgets.Layout(justify_content="space-between", align_items="center"))
+
+        filter_search_results.children = [header_row] + result_buttons
 
     def _on_search_change(change):
-        _update_search_results(change["new"])
+        if search_state["is_open"]:
+            _update_search_results(change["new"])
 
     filter_search_input.observe(_on_search_change, names="value")
 
-    # Initialize search results
-    _update_search_results("")
+    # Button to open/toggle search
+    open_search_btn = widgets.Button(
+        description="+ Add Filter",
+        button_style="info",
+        layout=widgets.Layout(width="100%", margin="0"),
+    )
 
-    # Combined search widget
-    add_filter_container = VBox([
-        widgets.HTML(
-            "<div style='font-size: 11px; color: #666; margin-bottom: 4px;'>"
-            "Add Filter:</div>"
-        ),
+    # Search panel container (initially hidden)
+    search_panel_container = VBox([
         filter_search_input,
         filter_search_results,
     ], layout=widgets.Layout(
         border="1px solid #ddd",
         border_radius="4px",
         padding="8px",
-        margin="5px 0",
+        margin="5px 0 0 0",
         background="#fafafa",
+        display="none",
     ))
+
+    # Store reference in state for show/hide functions
+    search_state["panel"] = search_panel_container
+
+    def _toggle_search_panel(b):
+        if search_state["is_open"]:
+            _hide_search_panel()
+        else:
+            _show_search_panel()
+
+    open_search_btn.on_click(_toggle_search_panel)
+
+    # Combined search widget
+    add_filter_container = VBox([
+        open_search_btn,
+        search_panel_container,
+    ])
 
     # -------------------------------------------------------------------------
     # Summary statistics cards (header area)
