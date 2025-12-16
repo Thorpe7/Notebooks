@@ -14,6 +14,125 @@ import pydicom
 import xnat
 
 
+# Default filename for ground truth CSV at project level
+GROUND_TRUTH_CSV_FILENAME = "ground_truth.csv"
+
+
+def _fetch_ground_truth_csv(
+    project,
+    csv_filename: str = GROUND_TRUTH_CSV_FILENAME,
+    verbose: bool = False,
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch ground truth CSV from project-level resources in XNAT.
+
+    The CSV should have columns: project, subject, experiment, scan_name, ground_truth
+
+    Parameters
+    ----------
+    project : xnat.Project
+        XNATpy project object
+    csv_filename : str
+        Name of the CSV file to look for in project resources
+    verbose : bool
+        If True, print status messages
+
+    Returns
+    -------
+    pd.DataFrame or None
+        DataFrame with ground truth labels, or None if not found
+    """
+    try:
+        # Check project resources for the ground truth CSV
+        for resource in project.resources.values():
+            for file_key, file_obj in resource.files.items():
+                file_id = getattr(file_obj, "id", None) or \
+                          getattr(file_obj, "path", None) or \
+                          str(file_key)
+
+                if file_id == csv_filename or file_id.endswith(f"/{csv_filename}"):
+                    if verbose:
+                        print(f"  Found ground truth CSV: {file_id}")
+
+                    # Read CSV using file.open() streaming
+                    if hasattr(file_obj, 'open'):
+                        with file_obj.open() as fin:
+                            gt_df = pd.read_csv(fin)
+
+                        if verbose:
+                            print(f"  Loaded {len(gt_df)} ground truth entries")
+
+                        return gt_df
+
+        if verbose:
+            print(f"  No ground truth CSV '{csv_filename}' found in project resources")
+
+    except Exception as e:
+        if verbose:
+            print(f"  [WARN] Failed to fetch ground truth CSV: {e}")
+
+    return None
+
+
+def _merge_ground_truth(
+    metadata_df: pd.DataFrame,
+    ground_truth_df: pd.DataFrame,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Merge ground truth labels into metadata DataFrame.
+
+    Joins on (project, subject, experiment, scan_name) matching to
+    (project_id, subject_label, experiment_label, scan_type).
+
+    Parameters
+    ----------
+    metadata_df : pd.DataFrame
+        Metadata DataFrame from fetch_xnat_metadata
+    ground_truth_df : pd.DataFrame
+        Ground truth DataFrame with columns: project, subject, experiment, scan_name, ground_truth
+    verbose : bool
+        If True, print merge statistics
+
+    Returns
+    -------
+    pd.DataFrame
+        Metadata DataFrame with ground_truth column added
+    """
+    # Rename ground_truth columns to match metadata columns for merge
+    gt_renamed = ground_truth_df.rename(columns={
+        "project": "project_id",
+        "subject": "subject_label",
+        "experiment": "experiment_label",
+        "scan_name": "scan_type",
+    })
+
+    # Merge on the key columns
+    merge_cols = ["project_id", "subject_label", "experiment_label", "scan_type"]
+
+    # Only use columns that exist in both DataFrames
+    available_merge_cols = [c for c in merge_cols if c in metadata_df.columns and c in gt_renamed.columns]
+
+    if not available_merge_cols:
+        if verbose:
+            print("  [WARN] No matching columns for ground truth merge")
+        metadata_df["ground_truth"] = None
+        return metadata_df
+
+    merged = metadata_df.merge(
+        gt_renamed[available_merge_cols + ["ground_truth"]],
+        on=available_merge_cols,
+        how="left",
+    )
+
+    if verbose:
+        n_matched = merged["ground_truth"].notna().sum()
+        n_total = len(merged)
+        print(f"  Ground truth merge: {n_matched}/{n_total} records matched")
+
+    return merged
+
+
 # DICOM tags we care about for dashboarding
 DICOM_TAGS = {
     "PatientID": ("0010", "0020"),
@@ -542,6 +661,8 @@ def fetch_xnat_metadata(
     user: Optional[str] = None,
     password: Optional[str] = None,
     include_dicom_metrics: bool = True,
+    include_ground_truth: bool = True,
+    ground_truth_filename: str = GROUND_TRUTH_CSV_FILENAME,
     save_csv: bool = False,
     csv_filename: Optional[str] = None,
     save_dir: str = "logs/saved_df",
@@ -579,6 +700,12 @@ def fetch_xnat_metadata(
         additional image metrics (resolution, pixel spacing, bits, acquisition
         parameters, etc.). Does not require mounted filesystem access.
         Set to False for faster metadata retrieval when image metrics aren't needed.
+    include_ground_truth : bool, default True
+        If True, fetches ground truth labels from a project-level CSV file and
+        merges them into the metadata DataFrame. The CSV should have columns:
+        (project, subject, experiment, scan_name, ground_truth).
+    ground_truth_filename : str, default "ground_truth.csv"
+        Name of the ground truth CSV file to look for in project resources.
     save_csv : bool, default False
         If True and csv_filename is provided, saves the DataFrame to a CSV file.
         On subsequent calls, if the CSV exists, it will be loaded instead of
@@ -620,6 +747,9 @@ def fetch_xnat_metadata(
         - scan_type: Type/series description of the scan
         - scan_quality: Quality rating of the scan
         - scan_note: Notes associated with the scan
+
+        Ground truth (when include_ground_truth=True):
+        - ground_truth: Label from project-level CSV (e.g., BIRADS score)
 
         Image metrics (when include_dicom_metrics=True, fetched via XNATpy):
         - rows, columns: Image dimensions in pixels
@@ -734,6 +864,9 @@ def fetch_xnat_metadata(
         # Discovery log for tracking new scan types and metadata headers
         discovery_log: List[Dict[str, Any]] = []
 
+        # Collect ground truth DataFrames from each project
+        ground_truth_dfs: List[pd.DataFrame] = []
+
         if verbose:
             print(f"\n{'#'*60}")
             print(f"# XNAT METADATA EXTRACTION - VERBOSE MODE")
@@ -751,6 +884,18 @@ def fetch_xnat_metadata(
 
             project = connection.projects[project_id]
             project_name = getattr(project, "name", project_id)
+
+            # Fetch ground truth CSV if requested
+            if include_ground_truth:
+                if verbose:
+                    print(f"Fetching ground truth CSV for project: {project_id}")
+                gt_df = _fetch_ground_truth_csv(
+                    project,
+                    csv_filename=ground_truth_filename,
+                    verbose=verbose,
+                )
+                if gt_df is not None:
+                    ground_truth_dfs.append(gt_df)
 
             # Iterate through all subjects in the project
             for subject in project.subjects.values():
@@ -821,9 +966,22 @@ def fetch_xnat_metadata(
                 df["experiment_date"], errors="coerce"
             )
 
-        # Reorder columns to put project info first
+        # Merge ground truth labels if available
+        if include_ground_truth and ground_truth_dfs:
+            # Concatenate all ground truth DataFrames
+            combined_gt = pd.concat(ground_truth_dfs, ignore_index=True)
+            if verbose:
+                print(f"Merging ground truth: {len(combined_gt)} entries from {len(ground_truth_dfs)} project(s)")
+            df = _merge_ground_truth(df, combined_gt, verbose=verbose)
+        elif include_ground_truth:
+            # No ground truth found, add empty column
+            df["ground_truth"] = None
+
+        # Reorder columns to put project info first, ground_truth early
         cols = df.columns.tolist()
         priority_cols = ["project_id", "project_name"]
+        if "ground_truth" in cols:
+            priority_cols.append("ground_truth")
         other_cols = [c for c in cols if c not in priority_cols]
         df = df[priority_cols + other_cols]
 

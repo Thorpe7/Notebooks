@@ -1,5 +1,6 @@
 """ Pytorch utility script to load data from XNAT data hierarchy into pytorch dataset """
-import os, re, logging
+import os
+import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Union
 import numpy as np
@@ -11,43 +12,56 @@ import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
 
-_BIRADS_RE = re.compile(r'BIRADS[_-]?(\d+)', re.IGNORECASE)
-
 
 def find_dicom_paths_from_dataframe(
     df: pd.DataFrame,
     base_dir: str = "/data",
+    label_column: str = "ground_truth",
 ) -> tuple[list[str], list[int]]:
     """
-    Extract DICOM file paths and BIRADS labels from a metadata DataFrame.
+    Extract DICOM file paths and labels from a metadata DataFrame.
 
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with columns: project_id, experiment_label
-        The experiment_label should contain BIRADS info (e.g., '20588458_BIRADS_2_1798085734')
+        DataFrame with columns: project_id, experiment_label, and label_column
+        The label_column (default: 'ground_truth') contains the class labels.
     base_dir : str
         Base directory for XNAT data mount (default: '/data')
+    label_column : str
+        Name of the column containing ground truth labels (default: 'ground_truth')
 
     Returns
     -------
     tuple[list[str], list[int]]
-        List of DICOM file paths and corresponding BIRADS labels
+        List of DICOM file paths and corresponding labels
     """
     paths, labels = [], []
+
+    # Check if label column exists
+    if label_column not in df.columns:
+        raise ValueError(
+            f"Label column '{label_column}' not found in DataFrame. "
+            f"Available columns: {list(df.columns)}"
+        )
 
     for _, row in df.iterrows():
         project_id = row.get('project_id')
         experiment_label = row.get('experiment_label')
+        label = row.get(label_column)
 
         if pd.isna(project_id) or pd.isna(experiment_label):
             continue
 
-        # Extract BIRADS label from experiment_label
-        m = _BIRADS_RE.search(str(experiment_label))
-        if not m:
+        # Skip rows without a valid label
+        if pd.isna(label):
             continue
-        label = int(m.group(1))
+
+        # Convert label to int
+        try:
+            label = int(label)
+        except (ValueError, TypeError):
+            continue
 
         # Build path to experiment directory and find DICOM files
         exp_path = Path(base_dir) / "projects" / project_id / "experiments" / experiment_label / "SCANS"
@@ -61,24 +75,100 @@ def find_dicom_paths_from_dataframe(
             labels.append(label)
 
     if not paths:
-        raise RuntimeError(f"No DICOMs found from DataFrame entries in {base_dir}")
+        raise RuntimeError(
+            f"No DICOMs found from DataFrame entries in {base_dir}. "
+            f"Check that '{label_column}' column has valid labels and paths exist."
+        )
 
     return paths, labels
 
 
-def find_dicom_paths_with_labels(proj_id: str, base_dir: str = "/data") -> tuple[list[str], list[int]]:
-    base = Path(base_dir) / "projects" / proj_id / "experiments"
+def find_dicom_paths_with_labels(
+    proj_id: str,
+    base_dir: str = "/data",
+    ground_truth_filename: str = "ground_truth.csv",
+) -> tuple[list[str], list[int]]:
+    """
+    Find DICOM paths and labels for a project using filesystem and ground truth CSV.
+
+    Parameters
+    ----------
+    proj_id : str
+        XNAT project ID
+    base_dir : str
+        Base directory for XNAT data mount (default: '/data')
+    ground_truth_filename : str
+        Name of the ground truth CSV file in project resources
+
+    Returns
+    -------
+    tuple[list[str], list[int]]
+        List of DICOM file paths and corresponding labels
+    """
+    project_path = Path(base_dir) / "projects" / proj_id
+    experiments_path = project_path / "experiments"
+
+    # Look for ground truth CSV in project resources
+    gt_csv_path = None
+    resources_path = project_path / "resources"
+    if resources_path.exists():
+        for csv_file in resources_path.glob(f"**/{ground_truth_filename}"):
+            gt_csv_path = csv_file
+            break
+
+    if gt_csv_path is None:
+        raise FileNotFoundError(
+            f"Ground truth CSV '{ground_truth_filename}' not found in project resources at {resources_path}. "
+            "Please ensure the CSV is uploaded to the project-level resources in XNAT."
+        )
+
+    # Load ground truth CSV
+    gt_df = pd.read_csv(gt_csv_path)
+
+    # Build lookup dict: (subject, experiment, scan_name) -> ground_truth
+    # The CSV has columns: project, subject, experiment, scan_name, ground_truth
+    label_lookup = {}
+    for _, row in gt_df.iterrows():
+        key = (
+            str(row.get("subject", "")),
+            str(row.get("experiment", "")),
+            str(row.get("scan_name", "")),
+        )
+        label = row.get("ground_truth")
+        if pd.notna(label):
+            try:
+                label_lookup[key] = int(label)
+            except (ValueError, TypeError):
+                pass
+
+    # Find DICOM files and match to labels
     paths, labels = [], []
-    for dcm in base.glob("*/SCANS/*/secondary/*.dcm"):
-        subj = dcm.parents[3].name  # experiments/<subject_BIRADS_x_UID>
-        m = _BIRADS_RE.search(subj)
-        if not m:
-            continue
-        label = int(m.group(1))  # e.g., 1..6
-        paths.append(str(dcm))
-        labels.append(label)
+    for dcm in experiments_path.glob("*/SCANS/*/secondary/*.dcm"):
+        # Extract experiment label from path
+        experiment_label = dcm.parents[3].name
+
+        # Extract subject label (may be part of experiment label or need lookup)
+        # For now, try to match on experiment label
+        scan_dir = dcm.parents[1].name
+        scan_type = scan_dir.split("_", 1)[0] if "_" in scan_dir else scan_dir
+
+        # Try different key combinations to find a match
+        matched_label = None
+        for (subj, exp, scan_name), label in label_lookup.items():
+            if exp == experiment_label:
+                matched_label = label
+                break
+
+        if matched_label is not None:
+            paths.append(str(dcm))
+            labels.append(matched_label)
+
     if not paths:
-        raise RuntimeError(f"No DICOMs found under {base}")
+        raise RuntimeError(
+            f"No DICOMs found with matching labels under {experiments_path}. "
+            f"Ground truth CSV has {len(label_lookup)} entries."
+        )
+
     return paths, labels
 
 def dicom_to_numpy(path: str) -> np.ndarray:
@@ -122,8 +212,9 @@ class DICOMDataset(Dataset):
             x = self.transform(x)
         return x, y
 
-def _make_class_names_from_birads(unique_birads: list[int]) -> list[str]:
-    return [f"BIRADS_{l}" for l in unique_birads]
+def _make_class_names(unique_labels: list[int], prefix: str = "CLASS") -> list[str]:
+    """Generate human-readable class names from unique label values."""
+    return [f"{prefix}_{label}" for label in unique_labels]
 
 def load_dicom_data_with_logging(
     data_source: Union[str, pd.DataFrame],  # project id, CSV path, or DataFrame
@@ -132,6 +223,8 @@ def load_dicom_data_with_logging(
     val_split: float = 0.2,
     image_size: int = 224,   # target image size (height and width)
     base_dir: str = "/data",  # base directory for XNAT data mount
+    label_column: str = "ground_truth",  # column containing labels
+    class_prefix: str = "CLASS",  # prefix for class names (e.g., "BIRADS" -> "BIRADS_1")
 ) -> Dict[str, DataLoader]:
     """
     Load DICOM data into PyTorch DataLoaders with stratified train/val split.
@@ -142,7 +235,7 @@ def load_dicom_data_with_logging(
         One of:
         - Project ID string (e.g., "InBreastProject") - scans mounted directory
         - Path to CSV file containing filtered metadata
-        - DataFrame with columns: project_id, experiment_label
+        - DataFrame with columns: project_id, experiment_label, and label_column
     batch_size : int
         Batch size for DataLoaders
     num_workers : int
@@ -153,6 +246,11 @@ def load_dicom_data_with_logging(
         Target image size (height and width)
     base_dir : str
         Base directory for XNAT data mount (default: '/data')
+    label_column : str
+        Name of the column containing ground truth labels (default: 'ground_truth')
+    class_prefix : str
+        Prefix for human-readable class names (default: 'CLASS').
+        E.g., 'BIRADS' produces class names like 'BIRADS_1', 'BIRADS_2', etc.
 
     Returns
     -------
@@ -167,28 +265,32 @@ def load_dicom_data_with_logging(
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
-    # 1) Discover files + BI-RADS labels based on data_source type
+    # 1) Discover files + labels based on data_source type
     if isinstance(data_source, pd.DataFrame):
         # Use DataFrame directly
         logging.info(f"Loading DICOM paths from DataFrame with {len(data_source)} rows")
-        paths, targets_birads = find_dicom_paths_from_dataframe(data_source, base_dir=base_dir)
+        paths, targets = find_dicom_paths_from_dataframe(
+            data_source, base_dir=base_dir, label_column=label_column
+        )
     elif isinstance(data_source, str) and data_source.endswith('.csv'):
         # Load from CSV file
         logging.info(f"Loading DICOM paths from CSV: {data_source}")
         df = pd.read_csv(data_source)
-        paths, targets_birads = find_dicom_paths_from_dataframe(df, base_dir=base_dir)
+        paths, targets = find_dicom_paths_from_dataframe(
+            df, base_dir=base_dir, label_column=label_column
+        )
     else:
         # Assume it's a project ID (original behavior)
         logging.info(f"Loading DICOM paths from project: {data_source}")
-        paths, targets_birads = find_dicom_paths_with_labels(data_source, base_dir=base_dir)
+        paths, targets = find_dicom_paths_with_labels(data_source, base_dir=base_dir)
 
     indices = np.arange(len(paths))
 
-    # 2) Build mapping BI-RADS -> contiguous ids (0..K-1)
-    unique_birads_sorted = sorted(set(targets_birads))   # e.g., [1,2,3,4,5,6]
-    label2id = {lbl: i for i, lbl in enumerate(unique_birads_sorted)}  # 1->0, 2->1, ...
+    # 2) Build mapping labels -> contiguous ids (0..K-1)
+    unique_labels_sorted = sorted(set(targets))   # e.g., [1,2,3,4,5,6]
+    label2id = {lbl: i for i, lbl in enumerate(unique_labels_sorted)}  # 1->0, 2->1, ...
     id2label = {i: lbl for lbl, i in label2id.items()}
-    targets_remap = [label2id[y] for y in targets_birads]  # now 0..K-1
+    targets_remap = [label2id[y] for y in targets]  # now 0..K-1
 
     # 3) Transforms with data augmentation for training
     # Augmentations help prevent overfitting on small medical imaging datasets
@@ -210,12 +312,12 @@ def load_dicom_data_with_logging(
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
 
-    # 4) Stratified split (use original BI-RADS or remapped—either is fine)
+    # 4) Stratified split (use original labels)
     splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
-    train_idx, val_idx = next(splitter.split(X=indices, y=targets_birads))
+    train_idx, val_idx = next(splitter.split(X=indices, y=targets))
 
-    # 5) Human-readable class names (keep BI-RADS wording)
-    class_names = _make_class_names_from_birads(unique_birads_sorted)
+    # 5) Human-readable class names
+    class_names = _make_class_names(unique_labels_sorted, prefix=class_prefix)
 
     # 6) Datasets with REMAPPED labels
     train_ds = DICOMDataset([paths[i] for i in train_idx],
@@ -230,7 +332,7 @@ def load_dicom_data_with_logging(
                             label2id=label2id, id2label=id2label)
 
     logging.info(f"Stratified split complete. train={len(train_ds)}, val={len(val_ds)}")
-    logging.info(f"Classes (BI-RADS): {unique_birads_sorted}")
+    logging.info(f"Classes: {unique_labels_sorted} (prefix: {class_prefix})")
     logging.info(f"Mapping label2id: {label2id}")
 
     # 7) Weighted sampler (use remapped labels)
