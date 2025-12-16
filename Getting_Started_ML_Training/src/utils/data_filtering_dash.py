@@ -147,6 +147,7 @@ def data_filter_dashboard(
         "filtered_df": df.copy(),
         "original_df": df.copy(),
         "active_filter_columns": [],
+        "plot_visible_columns": set(),  # Columns that should show in plots
     }
 
     # Link state to dashboard object for external access
@@ -249,6 +250,20 @@ def data_filter_dashboard(
     all_filterable_columns = _get_all_filterable_columns(df)
     state["active_filter_columns"] = _get_default_filter_columns(df)
 
+    # Set default plot visible columns (first 2-3 that would make good plots)
+    default_plot_cols = []
+    for col in state["active_filter_columns"]:
+        if col in df.columns:
+            # Good for distributions/pie: categorical or low cardinality
+            if df[col].dtype == "object" or df[col].nunique() <= 10:
+                default_plot_cols.append(col)
+            # Good for histograms: numeric with some variation
+            elif np.issubdtype(df[col].dtype, np.number) and df[col].nunique() > 5:
+                default_plot_cols.append(col)
+        if len(default_plot_cols) >= 3:
+            break
+    state["plot_visible_columns"] = set(default_plot_cols)
+
     if not all_filterable_columns:
         dashboard_obj.widget = VBox([
             widgets.HTML(
@@ -262,6 +277,7 @@ def data_filter_dashboard(
     # Filter widget creation and management
     # -------------------------------------------------------------------------
     filter_widgets = {}
+    plot_toggle_widgets = {}  # Checkboxes for toggling plot visibility
     filter_container = VBox()
 
     def _create_filter_widget(col: str) -> Optional[widgets.Widget]:
@@ -328,6 +344,7 @@ def data_filter_dashboard(
         """Rebuild filter widgets based on active columns."""
         # Clear existing
         filter_widgets.clear()
+        plot_toggle_widgets.clear()
 
         filter_boxes = []
         for col in state["active_filter_columns"]:
@@ -339,14 +356,57 @@ def data_filter_dashboard(
                 if hasattr(widget, "observe"):
                     widget.observe(_update, names="value")
 
-                # Create a labeled box for this filter
-                label = widgets.HTML(
-                    f"<div style='background: #2c3e50; color: white; padding: 5px 10px; "
-                    f"border-radius: 4px 4px 0 0; font-weight: bold; font-size: 12px;'>"
-                    f"{col.replace('_', ' ').title()}</div>"
+                # Create plot visibility toggle checkbox
+                plot_toggle = widgets.Checkbox(
+                    value=col in state["plot_visible_columns"],
+                    description="Show in plots",
+                    indent=False,
+                    layout=widgets.Layout(width="auto"),
+                    style={"description_width": "initial"},
                 )
+
+                def _make_toggle_handler(column):
+                    def handler(change):
+                        if change["new"]:
+                            state["plot_visible_columns"].add(column)
+                        else:
+                            state["plot_visible_columns"].discard(column)
+                        _update()
+                    return handler
+
+                plot_toggle.observe(_make_toggle_handler(col), names="value")
+                plot_toggle_widgets[col] = plot_toggle
+
+                # Create header with title and toggle
+                header = HBox([
+                    widgets.HTML(
+                        f"<div style='font-weight: bold; font-size: 12px; color: white;'>"
+                        f"{col.replace('_', ' ').title()}</div>"
+                    ),
+                ], layout=widgets.Layout(
+                    justify_content="space-between",
+                    align_items="center",
+                    width="100%",
+                ))
+
+                header_container = VBox([
+                    widgets.HTML(
+                        f"<div style='background: #2c3e50; color: white; padding: 5px 10px; "
+                        f"border-radius: 4px 4px 0 0; font-weight: bold; font-size: 12px;'>"
+                        f"{col.replace('_', ' ').title()}</div>"
+                    ),
+                ])
+
+                # Toggle row below the filter
+                toggle_row = HBox([
+                    plot_toggle,
+                ], layout=widgets.Layout(
+                    padding="2px 10px",
+                    background="#ecf0f1",
+                ))
+
                 filter_box = VBox(
-                    [label, widget],
+                    [header_container, widget, toggle_row],
                     layout=widgets.Layout(
                         border="1px solid #bdc3c7",
                         border_radius="4px",
@@ -459,20 +519,14 @@ def data_filter_dashboard(
     )
 
     def _plot_distributions(filtered: pd.DataFrame):
-        """Plot distribution bar charts for categorical columns."""
-        plot_cols = [c for c in state["active_filter_columns"]
+        """Plot distribution bar charts for categorical columns with plot visibility enabled."""
+        # Only plot columns that have plot visibility toggled ON
+        plot_cols = [c for c in state["plot_visible_columns"]
                     if c in filtered.columns and
                     (filtered[c].dtype == "object" or filtered[c].nunique() <= 20)][:6]
 
-        # Add extra categorical columns if we don't have enough
-        if len(plot_cols) < 4:
-            extra = [c for c in all_filterable_columns
-                    if c in filtered.columns and c not in plot_cols and
-                    (filtered[c].dtype == "object" or filtered[c].nunique() <= 15)]
-            plot_cols.extend(extra[:6 - len(plot_cols)])
-
         if not plot_cols:
-            print("No suitable categorical columns for distribution plots.")
+            print("No columns selected for plotting. Use 'Show in plots' checkbox to enable plots for filters.")
             return
 
         n_cols = min(3, len(plot_cols))
@@ -518,17 +572,14 @@ def data_filter_dashboard(
         plt.show()
 
     def _plot_pie_charts(filtered: pd.DataFrame):
-        """Plot pie charts for key categorical columns."""
-        pie_cols = [c for c in ["project_name", "modality", "gender", "manufacturer",
-                                "body_part_examined", "scan_type", "photometric_interpretation"]
+        """Plot pie charts for columns with plot visibility enabled."""
+        # Only plot columns that have plot visibility toggled ON and are suitable for pie charts
+        pie_cols = [c for c in state["plot_visible_columns"]
                    if c in filtered.columns and 1 < filtered[c].nunique() <= 10][:4]
 
         if not pie_cols:
-            pie_cols = [c for c in all_filterable_columns
-                       if c in filtered.columns and 1 < filtered[c].nunique() <= 10][:4]
-
-        if not pie_cols:
-            print("No suitable columns for pie charts (need columns with 2-10 unique values).")
+            print("No columns selected for pie charts. Use 'Show in plots' checkbox to enable plots for filters.")
+            print("(Pie charts work best with columns having 2-10 unique values)")
             return
 
         n_cols = min(2, len(pie_cols))
@@ -579,24 +630,15 @@ def data_filter_dashboard(
         plt.show()
 
     def _plot_numeric_histograms(filtered: pd.DataFrame):
-        """Plot histograms for numeric columns."""
-        # Prioritize imaging-specific metrics
-        numeric_cols = ["slice_thickness", "pixel_spacing_row", "pixel_spacing_col",
-                       "voxel_volume_mm3", "pixel_area_mm2",
-                       "rows", "columns", "num_slices", "age", "bits_stored",
-                       "window_center", "window_width"]
-        numeric_cols = [c for c in numeric_cols if c in filtered.columns and
+        """Plot histograms for numeric columns with plot visibility enabled."""
+        # Only plot columns that have plot visibility toggled ON and are numeric
+        numeric_cols = [c for c in state["plot_visible_columns"]
+                       if c in filtered.columns and
                        np.issubdtype(filtered[c].dtype, np.number) and
                        filtered[c].nunique() > 2][:6]
 
         if not numeric_cols:
-            numeric_cols = [c for c in all_filterable_columns
-                          if c in filtered.columns and
-                          np.issubdtype(filtered[c].dtype, np.number) and
-                          filtered[c].nunique() > 5][:6]
-
-        if not numeric_cols:
-            print("No numeric columns available for histograms.")
+            print("No numeric columns selected for histograms. Use 'Show in plots' checkbox to enable plots for filters.")
             return
 
         n_cols = min(3, len(numeric_cols))
@@ -802,9 +844,11 @@ def data_filter_dashboard(
 
     # Filter section
     filter_section_header = widgets.HTML(
-        """<div style="background: #ecf0f1; padding: 8px 12px; font-weight: bold;
-           font-size: 12px; color: #2c3e50; border-bottom: 1px solid #bdc3c7;">
-           Filters
+        """<div style="background: #ecf0f1; padding: 8px 12px; border-bottom: 1px solid #bdc3c7;">
+           <div style="font-weight: bold; font-size: 12px; color: #2c3e50;">Filters</div>
+           <div style="font-size: 10px; color: #7f8c8d; margin-top: 2px;">
+               Use checkboxes to toggle plot visibility
+           </div>
         </div>"""
     )
 
