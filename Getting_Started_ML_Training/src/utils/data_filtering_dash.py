@@ -439,9 +439,9 @@ def data_filter_dashboard(
         layout=widgets.Layout(width="100%"),
     )
 
-    # Container for search results (initially hidden)
+    # Container for search results (shows ~5 items, scrollable for more)
     filter_search_results = VBox(layout=widgets.Layout(
-        max_height="250px",
+        max_height="160px",
         overflow_y="auto",
         width="100%",
     ))
@@ -475,9 +475,9 @@ def data_filter_dashboard(
             # Show all available when no search
             matches = available
 
-        # Create clickable buttons for each match
+        # Create clickable buttons for each match (all available, scrollable)
         result_buttons = []
-        for col in matches[:20]:  # Limit to 20 results
+        for col in matches:
             btn = widgets.Button(
                 description=col.replace("_", " ").title(),
                 layout=widgets.Layout(width="100%", margin="1px 0"),
@@ -513,7 +513,7 @@ def data_filter_dashboard(
         if available:
             header_items.append(widgets.HTML(
                 f"<div style='padding: 4px 0; font-size: 10px; color: #888;'>"
-                f"Showing {len(matches[:20])} of {len(available)} available</div>"
+                f"{len(matches)} of {len(available)} available (scroll for more)</div>"
             ))
 
         close_btn = widgets.Button(
