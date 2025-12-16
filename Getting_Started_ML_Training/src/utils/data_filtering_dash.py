@@ -340,6 +340,26 @@ def data_filter_dashboard(
                 return widget
         return None
 
+    def _move_filter(col: str, direction: int):
+        """Move a filter up (-1) or down (+1) in the list."""
+        cols = state["active_filter_columns"]
+        idx = cols.index(col)
+        new_idx = idx + direction
+        if 0 <= new_idx < len(cols):
+            cols[idx], cols[new_idx] = cols[new_idx], cols[idx]
+            _rebuild_filter_widgets()
+            _update()
+
+    def _remove_filter(col: str):
+        """Remove a filter from the active list."""
+        if col in state["active_filter_columns"]:
+            state["active_filter_columns"].remove(col)
+            state["plot_visible_columns"].discard(col)
+            _rebuild_filter_widgets()
+            _update()
+            # Refresh search results to show the newly available filter
+            _update_search_results(filter_search_input.value)
+
     def _rebuild_filter_widgets():
         """Rebuild filter widgets based on active columns."""
         # Clear existing
@@ -347,7 +367,9 @@ def data_filter_dashboard(
         plot_toggle_widgets.clear()
 
         filter_boxes = []
-        for col in state["active_filter_columns"]:
+        num_filters = len(state["active_filter_columns"])
+
+        for idx, col in enumerate(state["active_filter_columns"]):
             widget = _create_filter_widget(col)
             if widget is not None:
                 filter_widgets[col] = widget
@@ -359,9 +381,9 @@ def data_filter_dashboard(
                 # Create plot visibility toggle checkbox
                 plot_toggle = widgets.Checkbox(
                     value=col in state["plot_visible_columns"],
-                    description="Show in plots",
+                    description="Plot",
                     indent=False,
-                    layout=widgets.Layout(width="auto"),
+                    layout=widgets.Layout(width="60px"),
                     style={"description_width": "initial"},
                 )
 
@@ -377,25 +399,54 @@ def data_filter_dashboard(
                 plot_toggle.observe(_make_toggle_handler(col), names="value")
                 plot_toggle_widgets[col] = plot_toggle
 
-                # Create header with title and toggle
-                header = HBox([
+                # Create move up/down buttons
+                up_btn = widgets.Button(
+                    description="",
+                    icon="arrow-up",
+                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                    disabled=(idx == 0),
+                )
+                down_btn = widgets.Button(
+                    description="",
+                    icon="arrow-down",
+                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                    disabled=(idx == num_filters - 1),
+                )
+                remove_btn = widgets.Button(
+                    description="",
+                    icon="times",
+                    button_style="danger",
+                    layout=widgets.Layout(width="28px", height="22px", padding="0"),
+                )
+
+                def _make_move_handler(column, direction):
+                    def handler(btn):
+                        _move_filter(column, direction)
+                    return handler
+
+                def _make_remove_handler(column):
+                    def handler(btn):
+                        _remove_filter(column)
+                    return handler
+
+                up_btn.on_click(_make_move_handler(col, -1))
+                down_btn.on_click(_make_move_handler(col, 1))
+                remove_btn.on_click(_make_remove_handler(col))
+
+                # Header with title and control buttons
+                header_container = HBox([
                     widgets.HTML(
-                        f"<div style='font-weight: bold; font-size: 12px; color: white;'>"
+                        f"<div style='font-weight: bold; font-size: 11px; color: white; flex: 1;'>"
                         f"{col.replace('_', ' ').title()}</div>"
                     ),
+                    HBox([up_btn, down_btn, remove_btn], layout=widgets.Layout(gap="2px")),
                 ], layout=widgets.Layout(
                     justify_content="space-between",
                     align_items="center",
-                    width="100%",
+                    background="#2c3e50",
+                    padding="4px 8px",
+                    border_radius="4px 4px 0 0",
                 ))
-
-                header_container = VBox([
-                    widgets.HTML(
-                        f"<div style='background: #2c3e50; color: white; padding: 5px 10px; "
-                        f"border-radius: 4px 4px 0 0; font-weight: bold; font-size: 12px;'>"
-                        f"{col.replace('_', ' ').title()}</div>"
-                    ),
-                ])
 
                 # Toggle row below the filter
                 toggle_row = HBox([
@@ -418,27 +469,109 @@ def data_filter_dashboard(
         filter_container.children = filter_boxes
 
     # -------------------------------------------------------------------------
-    # Column selector for adding/removing filters
+    # Column selector for adding/removing filters (with search)
     # -------------------------------------------------------------------------
-    available_to_add = [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
-
     add_filter_dropdown = widgets.Dropdown(
-        options=[("+ Add Filter...", "")] + [(c.replace("_", " ").title(), c) for c in available_to_add],
+        options=[("+ Add Filter...", "")],
         value="",
+        layout=widgets.Layout(width="100%", display="none"),  # Hidden, used programmatically
+    )
+
+    # Search input for filtering available columns
+    filter_search_input = widgets.Text(
+        placeholder="Search filters...",
         layout=widgets.Layout(width="100%"),
     )
 
-    def _on_add_filter(change):
-        if change["new"] and change["new"] not in state["active_filter_columns"]:
-            state["active_filter_columns"].append(change["new"])
-            # Update dropdown options
-            available = [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
-            add_filter_dropdown.options = [("+ Add Filter...", "")] + [(c.replace("_", " ").title(), c) for c in available]
-            add_filter_dropdown.value = ""
-            _rebuild_filter_widgets()
-            _update()
+    # Container for search results
+    filter_search_results = VBox(layout=widgets.Layout(
+        max_height="200px",
+        overflow_y="auto",
+        width="100%",
+    ))
 
-    add_filter_dropdown.observe(_on_add_filter, names="value")
+    def _get_available_filters():
+        """Get list of filters not currently active."""
+        return [c for c in all_filterable_columns if c not in state["active_filter_columns"]]
+
+    def _update_search_results(search_text: str = ""):
+        """Update the search results based on search text."""
+        available = _get_available_filters()
+        search_lower = search_text.lower().strip()
+
+        if search_lower:
+            # Filter by search text
+            matches = [c for c in available if search_lower in c.lower().replace("_", " ")]
+        else:
+            # Show first 10 when no search
+            matches = available[:10]
+
+        # Create clickable buttons for each match
+        result_buttons = []
+        for col in matches[:15]:  # Limit to 15 results
+            btn = widgets.Button(
+                description=col.replace("_", " ").title(),
+                layout=widgets.Layout(width="100%", margin="1px 0"),
+                button_style="",
+            )
+
+            def _make_add_handler(column):
+                def handler(b):
+                    if column not in state["active_filter_columns"]:
+                        state["active_filter_columns"].append(column)
+                        filter_search_input.value = ""
+                        _update_search_results("")
+                        _rebuild_filter_widgets()
+                        _update()
+                return handler
+
+            btn.on_click(_make_add_handler(col))
+            result_buttons.append(btn)
+
+        if not result_buttons and search_text:
+            result_buttons = [widgets.HTML(
+                "<div style='padding: 8px; color: #666; font-style: italic;'>"
+                "No matching filters found</div>"
+            )]
+        elif not result_buttons:
+            result_buttons = [widgets.HTML(
+                "<div style='padding: 8px; color: #666; font-style: italic;'>"
+                "All filters are active</div>"
+            )]
+
+        # Add count indicator
+        if available:
+            count_html = widgets.HTML(
+                f"<div style='padding: 4px 8px; font-size: 10px; color: #888;'>"
+                f"Showing {len(matches[:15])} of {len(available)} available filters</div>"
+            )
+            filter_search_results.children = [count_html] + result_buttons
+        else:
+            filter_search_results.children = result_buttons
+
+    def _on_search_change(change):
+        _update_search_results(change["new"])
+
+    filter_search_input.observe(_on_search_change, names="value")
+
+    # Initialize search results
+    _update_search_results("")
+
+    # Combined search widget
+    add_filter_container = VBox([
+        widgets.HTML(
+            "<div style='font-size: 11px; color: #666; margin-bottom: 4px;'>"
+            "Add Filter:</div>"
+        ),
+        filter_search_input,
+        filter_search_results,
+    ], layout=widgets.Layout(
+        border="1px solid #ddd",
+        border_radius="4px",
+        padding="8px",
+        margin="5px 0",
+        background="#fafafa",
+    ))
 
     # -------------------------------------------------------------------------
     # Summary statistics cards (header area)
@@ -856,7 +989,7 @@ def data_filter_dashboard(
     control_panel_content = VBox([
         filter_section_header,
         filter_container,
-        add_filter_dropdown,
+        add_filter_container,
         widgets.HTML("<hr style='margin: 10px 0; border-color: #ecf0f1;'>"),
         reset_btn,
         export_btn,
