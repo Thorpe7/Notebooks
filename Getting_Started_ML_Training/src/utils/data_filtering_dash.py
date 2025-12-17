@@ -168,6 +168,8 @@ def data_filter_dashboard(
         # This list prioritizes commonly useful imaging columns, but the dashboard
         # will dynamically include any column that exists in the DataFrame
         always_include = [
+            # Ground truth / labels
+            "ground_truth",
             # Core identifiers
             "project_name", "modality", "body_part_examined",
             # Core imaging metrics
@@ -212,15 +214,15 @@ def data_filter_dashboard(
             if dataframe[col].isna().all():
                 continue
 
-            # For object/string columns, check cardinality
+            # For object/string columns, check cardinality (allow up to 500 unique values)
             if dataframe[col].dtype == "object" or str(dataframe[col].dtype) == "category":
                 n_unique = dataframe[col].nunique()
-                if 1 < n_unique <= 100:
+                if n_unique >= 1 and n_unique <= 500:
                     candidates.append(col)
-            # For numeric columns
+            # For numeric columns (allow any with variation)
             elif np.issubdtype(dataframe[col].dtype, np.number):
                 n_unique = dataframe[col].nunique()
-                if 1 < n_unique <= 500:
+                if n_unique >= 1:
                     candidates.append(col)
         return candidates
 

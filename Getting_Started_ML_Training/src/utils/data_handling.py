@@ -43,14 +43,30 @@ def _fetch_ground_truth_csv(
         DataFrame with ground truth labels, or None if not found
     """
     try:
+        if verbose:
+            print(f"  Searching for '{csv_filename}' in project resources...")
+
         # Check project resources for the ground truth CSV
-        for resource in project.resources.values():
+        for resource_key, resource in project.resources.items():
+            resource_label = getattr(resource, "label", resource_key)
+            if verbose:
+                print(f"    Checking resource: {resource_label}")
+
             for file_key, file_obj in resource.files.items():
                 file_id = getattr(file_obj, "id", None) or \
                           getattr(file_obj, "path", None) or \
                           str(file_key)
 
-                if file_id == csv_filename or file_id.endswith(f"/{csv_filename}"):
+                if verbose:
+                    print(f"      File: {file_id}")
+
+                # Match by exact name or ending with the filename (case-insensitive)
+                file_id_lower = file_id.lower()
+                csv_filename_lower = csv_filename.lower()
+                if (file_id_lower == csv_filename_lower or
+                    file_id_lower.endswith(f"/{csv_filename_lower}") or
+                    file_id_lower.endswith(csv_filename_lower)):
+
                     if verbose:
                         print(f"  Found ground truth CSV: {file_id}")
 
@@ -61,6 +77,7 @@ def _fetch_ground_truth_csv(
 
                         if verbose:
                             print(f"  Loaded {len(gt_df)} ground truth entries")
+                            print(f"  Columns: {list(gt_df.columns)}")
 
                         return gt_df
 
@@ -70,6 +87,8 @@ def _fetch_ground_truth_csv(
     except Exception as e:
         if verbose:
             print(f"  [WARN] Failed to fetch ground truth CSV: {e}")
+            import traceback
+            traceback.print_exc()
 
     return None
 
@@ -99,38 +118,100 @@ def _merge_ground_truth(
     pd.DataFrame
         Metadata DataFrame with ground_truth column added
     """
-    # Rename ground_truth columns to match metadata columns for merge
-    gt_renamed = ground_truth_df.rename(columns={
+    if verbose:
+        print(f"  Ground truth CSV columns: {list(ground_truth_df.columns)}")
+        print(f"  Metadata columns: {list(metadata_df.columns)[:10]}...")
+
+    # Create a copy of ground_truth_df to avoid modifying original
+    gt_df = ground_truth_df.copy()
+
+    # Normalize column names (lowercase, strip whitespace)
+    gt_df.columns = [c.strip().lower() for c in gt_df.columns]
+
+    # Map common column name variations to standard names
+    column_mapping = {
+        # project variations
         "project": "project_id",
+        "project_id": "project_id",
+        "projectid": "project_id",
+        # subject variations
         "subject": "subject_label",
+        "subject_label": "subject_label",
+        "subjectlabel": "subject_label",
+        "subject_id": "subject_label",
+        # experiment variations
         "experiment": "experiment_label",
+        "experiment_label": "experiment_label",
+        "experimentlabel": "experiment_label",
+        "session": "experiment_label",
+        # scan_name variations
         "scan_name": "scan_type",
+        "scanname": "scan_type",
+        "scan_type": "scan_type",
+        "scantype": "scan_type",
+        "scan": "scan_type",
+        # ground_truth variations
+        "ground_truth": "ground_truth",
+        "groundtruth": "ground_truth",
+        "label": "ground_truth",
+        "class": "ground_truth",
+        "birads": "ground_truth",
+    }
+
+    # Apply column mapping
+    gt_renamed = gt_df.rename(columns={
+        c: column_mapping.get(c, c) for c in gt_df.columns
     })
 
-    # Merge on the key columns
-    merge_cols = ["project_id", "subject_label", "experiment_label", "scan_type"]
+    if verbose:
+        print(f"  Renamed ground truth columns: {list(gt_renamed.columns)}")
 
-    # Only use columns that exist in both DataFrames
-    available_merge_cols = [c for c in merge_cols if c in metadata_df.columns and c in gt_renamed.columns]
-
-    if not available_merge_cols:
+    # Ensure ground_truth column exists
+    if "ground_truth" not in gt_renamed.columns:
         if verbose:
-            print("  [WARN] No matching columns for ground truth merge")
+            print("  [WARN] No 'ground_truth' column found in CSV")
         metadata_df["ground_truth"] = None
         return metadata_df
 
-    merged = metadata_df.merge(
-        gt_renamed[available_merge_cols + ["ground_truth"]],
-        on=available_merge_cols,
-        how="left",
-    )
+    # Merge on the key columns - try different combinations
+    merge_col_options = [
+        ["project_id", "subject_label", "experiment_label", "scan_type"],
+        ["subject_label", "experiment_label", "scan_type"],
+        ["experiment_label", "scan_type"],
+        ["subject_label", "experiment_label"],
+        ["experiment_label"],
+    ]
 
+    for merge_cols in merge_col_options:
+        available_merge_cols = [c for c in merge_cols
+                               if c in metadata_df.columns and c in gt_renamed.columns]
+
+        if len(available_merge_cols) == len(merge_cols):
+            if verbose:
+                print(f"  Attempting merge on: {available_merge_cols}")
+
+            # Get only the columns we need for merge
+            gt_subset = gt_renamed[available_merge_cols + ["ground_truth"]].drop_duplicates()
+
+            merged = metadata_df.merge(
+                gt_subset,
+                on=available_merge_cols,
+                how="left",
+            )
+
+            n_matched = merged["ground_truth"].notna().sum()
+            if verbose:
+                n_total = len(merged)
+                print(f"  Ground truth merge: {n_matched}/{n_total} records matched")
+
+            if n_matched > 0:
+                return merged
+
+    # If no merge worked, add empty column
     if verbose:
-        n_matched = merged["ground_truth"].notna().sum()
-        n_total = len(merged)
-        print(f"  Ground truth merge: {n_matched}/{n_total} records matched")
-
-    return merged
+        print("  [WARN] No successful merge - adding empty ground_truth column")
+    metadata_df["ground_truth"] = None
+    return metadata_df
 
 
 # DICOM tags we care about for dashboarding
