@@ -1,5 +1,6 @@
 """ Pytorch utility script to load data from XNAT data hierarchy into pytorch dataset """
 import os
+import re
 import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Union
@@ -17,6 +18,7 @@ def find_dicom_paths_from_dataframe(
     df: pd.DataFrame,
     base_dir: str = "/data",
     label_column: str = "ground_truth",
+    verbose: bool = False,
 ) -> tuple[list[str], list[int]]:
     """
     Extract DICOM file paths and labels from a metadata DataFrame.
@@ -30,6 +32,8 @@ def find_dicom_paths_from_dataframe(
         Base directory for XNAT data mount (default: '/data')
     label_column : str
         Name of the column containing ground truth labels (default: 'ground_truth')
+    verbose : bool
+        If True, print debugging information
 
     Returns
     -------
@@ -45,6 +49,23 @@ def find_dicom_paths_from_dataframe(
             f"Available columns: {list(df.columns)}"
         )
 
+    # Debug info
+    n_total = len(df)
+    n_valid_labels = df[label_column].notna().sum()
+    n_missing_project = df['project_id'].isna().sum() if 'project_id' in df.columns else n_total
+    n_missing_experiment = df['experiment_label'].isna().sum() if 'experiment_label' in df.columns else n_total
+
+    if verbose:
+        print(f"DataFrame has {n_total} rows")
+        print(f"  - Valid '{label_column}' values: {n_valid_labels}")
+        print(f"  - Missing project_id: {n_missing_project}")
+        print(f"  - Missing experiment_label: {n_missing_experiment}")
+        print(f"  - Unique labels: {df[label_column].dropna().unique().tolist()}")
+
+    paths_not_found = 0
+    rows_skipped_no_label = 0
+    rows_skipped_invalid_label = 0
+
     for _, row in df.iterrows():
         project_id = row.get('project_id')
         experiment_label = row.get('experiment_label')
@@ -55,18 +76,41 @@ def find_dicom_paths_from_dataframe(
 
         # Skip rows without a valid label
         if pd.isna(label):
+            rows_skipped_no_label += 1
             continue
 
-        # Convert label to int
+        # Convert label to int - handle various formats
+        original_label = label
         try:
+            # First try direct int conversion (handles int and numeric strings like "2")
             label = int(label)
         except (ValueError, TypeError):
-            continue
+            # Try float conversion first (handles "2.0" -> 2)
+            try:
+                label = int(float(label))
+            except (ValueError, TypeError):
+                # Try to extract numeric part from string (handles "BIRADS_2" -> 2)
+                if isinstance(original_label, str):
+                    numbers = re.findall(r'\d+', original_label)
+                    if numbers:
+                        # Take the last number found (e.g., "BIRADS_2" -> 2)
+                        label = int(numbers[-1])
+                    else:
+                        rows_skipped_invalid_label += 1
+                        if verbose and rows_skipped_invalid_label <= 3:
+                            print(f"  Skipping row with non-numeric label: '{original_label}'")
+                        continue
+                else:
+                    rows_skipped_invalid_label += 1
+                    continue
 
         # Build path to experiment directory and find DICOM files
-        exp_path = Path(base_dir) / "projects" / project_id / "experiments" / experiment_label / "SCANS"
+        exp_path = Path(base_dir) / "projects" / str(project_id) / "experiments" / str(experiment_label) / "SCANS"
 
         if not exp_path.exists():
+            paths_not_found += 1
+            if verbose and paths_not_found <= 3:
+                print(f"  Path not found: {exp_path}")
             continue
 
         # Find all DICOM files in secondary folders
@@ -74,11 +118,46 @@ def find_dicom_paths_from_dataframe(
             paths.append(str(dcm))
             labels.append(label)
 
+    if verbose:
+        print(f"\nResults:")
+        print(f"  - Rows skipped (no label): {rows_skipped_no_label}")
+        print(f"  - Rows skipped (invalid label): {rows_skipped_invalid_label}")
+        print(f"  - Paths not found: {paths_not_found}")
+        print(f"  - DICOM files found: {len(paths)}")
+
     if not paths:
-        raise RuntimeError(
-            f"No DICOMs found from DataFrame entries in {base_dir}. "
-            f"Check that '{label_column}' column has valid labels and paths exist."
-        )
+        # Provide detailed error message
+        # Get sample of unique ground_truth values for debugging
+        unique_gt_sample = df[label_column].dropna().unique()[:10].tolist() if n_valid_labels > 0 else []
+
+        error_details = [
+            f"No DICOMs found from DataFrame entries in {base_dir}.",
+            f"",
+            f"Debug info:",
+            f"  - Total rows in DataFrame: {n_total}",
+            f"  - Rows with valid '{label_column}': {n_valid_labels}",
+            f"  - Rows skipped (no label): {rows_skipped_no_label}",
+            f"  - Rows skipped (invalid label type): {rows_skipped_invalid_label}",
+            f"  - Experiment paths not found: {paths_not_found}",
+            f"  - Sample '{label_column}' values: {unique_gt_sample}",
+            f"",
+            f"Possible fixes:",
+        ]
+
+        if n_valid_labels == 0:
+            error_details.append(f"  - The '{label_column}' column has no valid values. Check your CSV or use a different label_column.")
+            error_details.append(f"  - Available columns: {list(df.columns)}")
+        elif rows_skipped_invalid_label > 0 and rows_skipped_invalid_label == n_valid_labels:
+            error_details.append(f"  - All {rows_skipped_invalid_label} labels have invalid format (no numbers found in strings).")
+            error_details.append(f"  - Labels should be integers (1, 2, 3) or strings with numbers ('BIRADS_2', 'Class_1').")
+        elif paths_not_found > 0:
+            error_details.append(f"  - {paths_not_found} experiment paths were not found. Check that base_dir='{base_dir}' is correct.")
+            # Show example expected path
+            sample_row = df[df[label_column].notna()].iloc[0] if n_valid_labels > 0 else df.iloc[0]
+            example_path = Path(base_dir) / "projects" / str(sample_row.get('project_id', '?')) / "experiments" / str(sample_row.get('experiment_label', '?')) / "SCANS"
+            error_details.append(f"  - Example expected path: {example_path}")
+
+        raise RuntimeError("\n".join(error_details))
 
     return paths, labels
 
@@ -225,6 +304,7 @@ def load_dicom_data_with_logging(
     base_dir: str = "/data",  # base directory for XNAT data mount
     label_column: str = "ground_truth",  # column containing labels
     class_prefix: str = "CLASS",  # prefix for class names (e.g., "BIRADS" -> "BIRADS_1")
+    verbose: bool = False,  # print detailed debugging info
 ) -> Dict[str, DataLoader]:
     """
     Load DICOM data into PyTorch DataLoaders with stratified train/val split.
@@ -251,6 +331,8 @@ def load_dicom_data_with_logging(
     class_prefix : str
         Prefix for human-readable class names (default: 'CLASS').
         E.g., 'BIRADS' produces class names like 'BIRADS_1', 'BIRADS_2', etc.
+    verbose : bool
+        If True, prints detailed debugging information about data loading
 
     Returns
     -------
@@ -269,19 +351,25 @@ def load_dicom_data_with_logging(
     if isinstance(data_source, pd.DataFrame):
         # Use DataFrame directly
         logging.info(f"Loading DICOM paths from DataFrame with {len(data_source)} rows")
+        if verbose:
+            print(f"Loading DICOM paths from DataFrame with {len(data_source)} rows")
         paths, targets = find_dicom_paths_from_dataframe(
-            data_source, base_dir=base_dir, label_column=label_column
+            data_source, base_dir=base_dir, label_column=label_column, verbose=verbose
         )
     elif isinstance(data_source, str) and data_source.endswith('.csv'):
         # Load from CSV file
         logging.info(f"Loading DICOM paths from CSV: {data_source}")
+        if verbose:
+            print(f"Loading DICOM paths from CSV: {data_source}")
         df = pd.read_csv(data_source)
         paths, targets = find_dicom_paths_from_dataframe(
-            df, base_dir=base_dir, label_column=label_column
+            df, base_dir=base_dir, label_column=label_column, verbose=verbose
         )
     else:
         # Assume it's a project ID (original behavior)
         logging.info(f"Loading DICOM paths from project: {data_source}")
+        if verbose:
+            print(f"Loading DICOM paths from project: {data_source}")
         paths, targets = find_dicom_paths_with_labels(data_source, base_dir=base_dir)
 
     indices = np.arange(len(paths))
