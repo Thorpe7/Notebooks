@@ -7,6 +7,7 @@ This notebook provides an introduction to working with Jupyter Notebooks within 
 1. [Basic Commands & Tools](#1-basic-commands--tools)
 2. [Finding & Exploring Mounted Data](#2-finding--exploring-mounted-data)
 3. [Using XNATpy SDK](#3-using-xnatpy-sdk)
+4. [Putting it All Together](#4-putting-it-all-together)
 
 ---
 
@@ -78,9 +79,21 @@ This notebook provides an introduction to working with Jupyter Notebooks within 
 - Understanding XNAT resource hierarchy
 
 ### 3.4 Working with Mounted Data via XNATpy
-- Accessing files through the API
-- Downloading resources programmatically
-- Combining mounted paths with API queries
+- Using `.data_dir` to get mounted paths for XNATpy objects
+- Combining API queries with mounted file access
 - Best practices for data access
+
+---
+
+## 4. Putting it All Together
+
+### 4.1 Creating a Pandas DataFrame
+- Iterating through XNATpy hierarchy to collect metadata
+- Building structured records from projects, experiments, and scans
+- Converting to pandas DataFrame
+- Adding file paths using mounted data directory
+
+### 4.2 Filtering the Data
+- *Coming soon...*
 
 ---
