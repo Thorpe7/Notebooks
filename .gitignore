@@ -2,6 +2,8 @@
 data/
 training_runs/
 logs/
+.vscode/
+.claude/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
